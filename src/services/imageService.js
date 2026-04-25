@@ -1,60 +1,100 @@
 const sharp = require('sharp');
-const fs = require('fs');
 const path = require('path');
 const File = require('../models/fileModel');
 const mime = require('mime');
+const fs = require('fs-extra');
+const FileService = require('./fileService');
+const StorageService = require('./storage/storageService');
+const config = require('../config');
 
 class ImageService {
-    static uploadDirectory = path.join(__dirname, '../../public/uploads');
+    static uploadDirectory = config.storage.localRoot;
 
-    static async convertImage(fileId, targetFormat, quality = 100) {
-        const originalFile = await File.findById(fileId);
-        if (!originalFile) throw new Error('Source file not found.');
+    static createError(message, statusCode) {
+        const error = new Error(message);
+        error.statusCode = statusCode;
+        return error;
+    }
+
+    static async convertImage(userId, fileId, targetFormat, quality = 100) {
+        const accessibleFile = await FileService.getAccessibleFileById(userId, fileId);
+
+        if (!accessibleFile) {
+            throw this.createError('Source file not found.', 404);
+        }
+
+        if (accessibleFile.userId.toString() !== userId.toString()) {
+            throw this.createError('Only the owner can convert this image.', 403);
+        }
+
+        const originalFile = accessibleFile;
+        FileService.assertPasswordAccess(originalFile, userId);
 
         targetFormat = targetFormat.toLowerCase();
 
         if (!['png', 'jpg', 'jpeg', 'webp', 'avif'].includes(targetFormat)) {
-            throw new Error('Invalid target format.');
+            throw this.createError('Invalid target format.', 400);
         }
 
-        // const originalFilePath = path.join(this.uploadDirectory, path.basename(originalFile.path));
+        const sourceMimeType = originalFile.mimetype || mime.getType(originalFile.name) || '';
+        if (!sourceMimeType.startsWith('image/')) {
+            throw this.createError('Source file is not an image.', 400);
+        }
+
         const outputFileName = `${path.basename(originalFile.name, path.extname(originalFile.name))}-converted-${Date.now()}.${targetFormat}`;
         const outputFilePath = path.join(path.dirname(originalFile.path), outputFileName);
-        const absoulteInputFilePath = path.join(this.uploadDirectory, originalFile.path);
-        const absoluteOutputFilePath = path.join(this.uploadDirectory, outputFilePath);
+        const absoluteInputFilePath = StorageService.isObjectStorage()
+            ? await FileService.materializeFile(originalFile)
+            : path.join(this.uploadDirectory, originalFile.path);
+        const absoluteOutputFilePath = StorageService.isObjectStorage()
+            ? FileService.getTempPath('image-conversions', originalFile.userId.toString(), outputFileName)
+            : path.join(this.uploadDirectory, outputFilePath);
 
-        console.log(outputFileName, outputFilePath, absoulteInputFilePath, absoluteOutputFilePath);
-        
-
-        if (!fs.existsSync(absoulteInputFilePath)) throw new Error('File not found.');
+        if (!fs.existsSync(absoluteInputFilePath)) {
+            throw this.createError('File not found.', 404);
+        }
 
         try {
+            await fs.ensureDir(path.dirname(absoluteOutputFilePath));
+
             // Perform the image conversion
-            await sharp(absoulteInputFilePath)
+            await sharp(absoluteInputFilePath)
                 .toFormat(targetFormat, { quality: parseInt(quality) || 100 })
                 .toFile(absoluteOutputFilePath);
 
             const fileStats = fs.statSync(absoluteOutputFilePath);
             const mimeType = mime.getType(absoluteOutputFilePath);
 
-            const newFile = new File({
-                name: outputFileName,
-                path: outputFilePath,
-                mimetype: mimeType,
-                size: fileStats.size,
-                userId: originalFile.userId,
-                parent_id: originalFile.parent_id
-            });
-
+            const newFile = await FileService.saveFileMetadata(
+                absoluteOutputFilePath,
+                originalFile.userId,
+                outputFileName,
+                originalFile.parent_id,
+                path.dirname(outputFilePath)
+            );
+            newFile.mimetype = mimeType;
+            newFile.size = fileStats.size;
             await newFile.save();
+            await FileService.recalculateFolderStats(originalFile.parent_id);
+
+            if (StorageService.isObjectStorage()) {
+                await fs.remove(absoluteInputFilePath);
+            }
 
             return {
                 message: 'Image converted successfully.',
-                filePath: `/uploads/${outputFileName}`
+                fileId: newFile._id.toString(),
+                fileName: newFile.name,
+                scanStatus: newFile.scanStatus,
+                filePath: newFile.path
             };
         } catch (error) {
             console.error('Image conversion failed:', error);
-            throw new Error('Image conversion failed.');
+            if (error.statusCode) {
+                throw error;
+            }
+
+            throw this.createError('Image conversion failed.', 500);
         }
     }
 }

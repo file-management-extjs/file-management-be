@@ -1,12 +1,31 @@
 const FileService = require('../services/fileService');
+const ScanningService = require('../services/scanningService');
 const path = require('path');
 const fs = require('fs');
 const { getIO } = require('../socket');
 const SearchService = require('../services/searchService');
+const BackgroundActivityService = require('../services/backgroundActivityService');
+const backgroundOperationRegistry = require('../services/backgroundOperationRegistry');
+
+function parseRangeHeader(rangeHeader) {
+    const match = String(rangeHeader || '').match(/^bytes=(\d+)-(\d+)?$/);
+    if (!match) {
+        return null;
+    }
+
+    const start = parseInt(match[1], 10);
+    const end = match[2] !== undefined ? parseInt(match[2], 10) : null;
+
+    if (!Number.isFinite(start) || start < 0 || (end !== null && (!Number.isFinite(end) || end < start))) {
+        return null;
+    }
+
+    return { start, end };
+}
 
 exports.uploadFiles = async (req, res) => {
     try {
-        const { filename, currentChunk, totalChunks, folderId } = req.body;
+        const { filename, currentChunk, totalChunks, folderId, fileSize, workspaceId } = req.body;
         const chunk = req.file; // Assuming you're using multer or similar middleware
 
         if (!filename || currentChunk == null || totalChunks == null || !chunk) {
@@ -16,7 +35,9 @@ exports.uploadFiles = async (req, res) => {
         const userId = req.userId; // Assuming userId is attached by middleware
 
         // Delegate chunk processing and progress tracking to FileService
-        await FileService.processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks);
+        await FileService.processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks, fileSize, {
+            workspaceId
+        });
 
         return res.status(200).json({ message: 'Chunk uploaded successfully', currentChunk });
     } catch (error) {
@@ -30,13 +51,16 @@ exports.getFiles = async (req, res) => {
     const userId = req.userId; // Assuming authentication middleware
     const parentId = req.query.parent_id || null;
     const search = req.query.search || null;
+    const shared = req.query.shared === 'true';
+    const sharedByMe = req.query.sharedByMe === 'true';
+    const workspaceId = req.query.workspaceId || null;
 
     try {
         res.setHeader('Content-Type', 'application/json');
         res.write('['); // Start JSON array
         let isFirst = true;
 
-        for await (const record of FileService.streamFilesGenerator(userId, parentId, search)) {
+        for await (const record of FileService.streamFilesGenerator(userId, parentId, search, { shared, sharedByMe, workspaceId })) {
             if (!isFirst) res.write(',');
             res.write(JSON.stringify(record));
             isFirst = false;
@@ -47,6 +71,35 @@ exports.getFiles = async (req, res) => {
     } catch (error) {
         console.error('Error in getFiles controller:', error);
         res.status(500).json({ error: 'Failed to fetch files and folders' });
+    }
+};
+
+exports.getDashboardSummary = async (req, res) => {
+    try {
+        const summary = await FileService.getDashboardSummary(req.userId, {
+            workspaceId: req.query.workspaceId || null
+        });
+        res.status(200).json({ success: true, summary });
+    } catch (error) {
+        console.error('Error fetching dashboard summary:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch dashboard summary' });
+    }
+};
+
+exports.requestVirusScan = async (req, res) => {
+    try {
+        const result = await ScanningService.requestFileScan(req.userId, req.params.fileId);
+
+        res.status(200).json({
+            success: true,
+            ...result
+        });
+    } catch (error) {
+        console.error('Error requesting virus scan:', error);
+        res.status(error.statusCode || 500).json({
+            success: false,
+            error: error.message || 'Failed to request virus scan.'
+        });
     }
 };
 
@@ -64,7 +117,7 @@ exports.downloadFile = async (req, res) => {
 // View file
 exports.viewFile = async (req, res) => {
     try {
-        const { filePath, mimeType } = await FileService.viewFile(req.userId, req.params.fileId);
+        const { file, filePath, mimeType } = await FileService.viewFile(req.userId, req.params.fileId);
 
         if (mimeType) {
             res.setHeader('Content-Type', mimeType);
@@ -74,7 +127,7 @@ exports.viewFile = async (req, res) => {
             res.setHeader('Content-Disposition', 'inline');
         }
 
-        const { stream, mimetype } = await FileService.getFileStream(filePath);
+        const { stream } = await FileService.getFileStream(file || filePath);
 
         if (!stream) {
             throw new Error('Failed to create file stream');
@@ -94,18 +147,17 @@ exports.viewFile = async (req, res) => {
         });
 
     } catch (err) {
-        if (err.message === 'Password verification required') {
-            res.status(401).json({ error: err.message });
-        } else {
-            res.status(404).json({ error: err.message });
-        }
+        const status = err.message === 'Password verification required'
+            ? 401
+            : (err.statusCode || 404);
+        res.status(status).json({ error: err.message });
     }
 };
 
 // Function to delete a single file
 exports.deleteFile = async (req, res) => {
     try {
-        await FileService.deleteFile(req.userId, req.params.id);
+        await FileService.deleteFile(req.userId, req.params.id, { workspaceId: req.query.workspaceId || req.body.workspaceId || null });
         res.json({ success: true, message: 'File deleted successfully.' });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Failed to delete file.' });
@@ -114,14 +166,14 @@ exports.deleteFile = async (req, res) => {
 
 // Function to delete multiple files
 exports.deleteMultipleFiles = async (req, res) => {
-    const { ids, parentId } = req.body;
+    const { ids, parentId, workspaceId } = req.body;
 
     if (!Array.isArray(ids) || ids.length === 0) {
         return res.status(400).json({ success: false, message: 'No file IDs provided.' });
     }
 
     try {
-        const deletedCount = await FileService.deleteMultipleFiles(req.userId, ids, parentId);
+        const deletedCount = await FileService.deleteMultipleFiles(req.userId, ids, parentId, { workspaceId });
 
         return res.json({ success: true, message: 'Files deleted successfully.', deletedCount });
         // if (deletedCount > 0) {
@@ -143,7 +195,7 @@ exports.createFolder = async (req, res) => {
     }
 
     try {
-        await FileService.createFolder(req.userId, name, parentId);
+        await FileService.createFolder(req.userId, name, parentId, { workspaceId: req.body.workspaceId || null });
         res.status(201).json({ message: 'Folder created successfully' });
     } catch (error) {
         console.error('Error creating folder:', error);
@@ -154,7 +206,7 @@ exports.createFolder = async (req, res) => {
 exports.compressFiles = async (req, res) => {
     try {
         const userId = req.userId; 
-        const { items, folder, parentId, zipFileName, archiveType, compressionLevel, progressId } = req.body;
+        const { items, folder, parentId, zipFileName, archiveType, compressionLevel, progressId, affectedItems, workspaceId } = req.body;
 
         // Validate request
         if (!items || !Array.isArray(items)) {
@@ -177,7 +229,9 @@ exports.compressFiles = async (req, res) => {
             parentId,
             archiveType,
             compressionLevel,
-            progressId
+            progressId,
+            affectedItems,
+            workspaceId
         });
 
         console.log('Created compression job:', {
@@ -200,44 +254,83 @@ exports.compressFiles = async (req, res) => {
 };
 
 exports.decompressFile = async (req, res) => {
+    let operationProgressId = null;
+
     try {
-        const { filePath, parentId } = req.body;
+        const { filePath, parentId, progressId, workspaceId } = req.body;
 
         if (!filePath) {
             return res.status(400).json({ error: 'filePath is required' });
         }
 
+        operationProgressId = progressId || `extraction-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        const fileName = path.basename(filePath);
+
+        backgroundOperationRegistry.start({
+            userId: req.userId,
+            progressId: operationProgressId,
+            type: 'Extraction',
+            title: `Extracting ${fileName}`,
+            detail: 'Archive extraction',
+            affectedFiles: [{
+                name: fileName,
+                fileName,
+                path: filePath,
+                status: 'Extracting'
+            }]
+        });
+
         console.log('Decompressing file:', filePath, 'with parentId:', parentId); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, null, parentId);
+        const result = await FileService.decompressFile(req.userId, filePath, null, parentId, {
+            workspaceId,
+            progressId: operationProgressId,
+            onProgress: (payload) => {
+                backgroundOperationRegistry.update(operationProgressId, {
+                    progress: payload.progress,
+                    status: 'running',
+                    statusText: 'Extracting'
+                });
+            }
+        });
+        backgroundOperationRegistry.complete(operationProgressId, {
+            statusText: 'Extracted'
+        });
         res.status(200).json(result);
     } catch (error) {
         console.error('Error decompressing file:', error);
+        if (operationProgressId) {
+            backgroundOperationRegistry.fail(operationProgressId, {
+                statusText: 'Failed',
+                detail: error.message
+            });
+        }
         res.status(500).json({ error: error.message });
     }
 };
 
 exports.stopCompression = async (req, res) => {
     try {
-        const { jobId } = req.body;
+        const { jobId, progressId } = req.body;
 
-        if (!jobId) {
-            return res.status(400).json({ error: 'jobId is required.' });
+        if (!jobId && !progressId) {
+            return res.status(400).json({ error: 'jobId or progressId is required.' });
         }
 
         const compressionQueue = require('../queues/compressionQueue');
-        console.log('Attempting to cancel job:', jobId);
+        console.log('Attempting to cancel job:', { jobId, progressId });
 
         // Use the new cancelJob function that handles both active and queued jobs
-        const cancelled = await compressionQueue.cancelJob(jobId, jobId);
+        const cancelled = await compressionQueue.cancelJob(jobId, progressId);
 
         if (cancelled) {
             res.status(200).json({ 
                 success: true,
                 message: 'Compression job cancelled successfully.',
-                jobId
+                jobId,
+                progressId
             });
         } else {
-            console.log('No job found with ID:', jobId);
+            console.log('No job found with identifiers:', { jobId, progressId });
             res.status(404).json({ 
                 success: false, 
                 error: 'No compression job found with the specified ID.' 
@@ -251,114 +344,183 @@ exports.stopCompression = async (req, res) => {
 
 exports.renameItem = async (req, res) => {
     try {
-        await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder);
+        await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder, {
+            workspaceId: req.body.workspaceId || null
+        });
         res.json({ success: true, message: 'File/Folder renamed successfully.' });
     } catch (err) {
         res.status(500).json({ success: false, message: `Failed to rename file/folder: ${err.message}` });
     }
 };
 
+exports.updateFileContent = async (req, res) => {
+    try {
+        const { content } = req.body;
+
+        if (typeof content !== 'string') {
+            return res.status(400).json({ success: false, message: 'Content must be a string.' });
+        }
+
+        const file = await FileService.updateFileContent(req.userId, req.params.fileId, content);
+        res.json({
+            success: true,
+            message: 'File updated successfully.',
+            file
+        });
+    } catch (error) {
+        if (error.message === 'Password verification required') {
+            return res.status(401).json({ success: false, message: error.message });
+        }
+
+        res.status(error.statusCode || 400).json({ success: false, message: error.message });
+    }
+};
+
 exports.moveItem = async (req, res) => {
-    const { itemIds, targetId, isTargetZip, progressId } = req.body;
+    const { itemIds, targetId, isTargetZip, progressId, workspaceId } = req.body;
+    const operationProgressId = progressId || `moving-${Date.now()}`;
 
     try {
+        backgroundOperationRegistry.start({
+            userId: req.userId,
+            progressId: operationProgressId,
+            type: 'Move',
+            title: `Moving ${(itemIds || []).length} item${(itemIds || []).length === 1 ? '' : 's'}`,
+            detail: 'Moving items between folders',
+            affectedFiles: (itemIds || []).map(itemId => ({
+                name: itemId,
+                fileName: itemId,
+                status: 'Queued'
+            }))
+        });
+
         const progressCallback = (itemName, progress) => {
             const io = getIO();
-            io.emit('movingProgress', { itemName, progress, progressId });
+            backgroundOperationRegistry.update(operationProgressId, {
+                progress,
+                status: 'running',
+                statusText: 'Moving',
+                detail: itemName ? `Moving ${itemName}` : 'Moving items'
+            });
+            io.to(req.userId.toString()).emit('movingProgress', { itemName, progress, progressId: operationProgressId });
         };
 
         if (isTargetZip) {
-            const result = await FileService.moveItemsIntoZip(req.userId, itemIds, targetId);
+            const result = await FileService.moveItemsIntoZip(req.userId, itemIds, targetId, { workspaceId });
+            backgroundOperationRegistry.complete(operationProgressId, {
+                statusText: 'Moved'
+            });
             res.status(200).json({ success: true, message: 'Items moved into ZIP file successfully', result });
         } else {
-            const result = await FileService.moveItems(req.userId, itemIds, targetId, progressCallback);
+            const result = await FileService.moveItems(req.userId, itemIds, targetId, progressCallback, { workspaceId });
+            backgroundOperationRegistry.complete(operationProgressId, {
+                statusText: 'Moved'
+            });
             res.status(200).json({ success: true, message: 'Items moved successfully', result });
         }
     } catch (error) {
         console.error('Error moving items:', error.message);
+        backgroundOperationRegistry.fail(operationProgressId, {
+            statusText: 'Failed',
+            detail: error.message
+        });
         res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.getBackgroundActivity = async (req, res) => {
+    try {
+        res.status(200).json(await BackgroundActivityService.getState(req.userId));
+    } catch (error) {
+        console.error('Error fetching background activity:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to fetch background activity.'
+        });
     }
 };
 
 
 exports.download = async (req, res) => {
-    const filePath = req.body.filePath;
-    const offset = parseInt(req.query.offset, 10) || 0;
-    const chunkSize = parseInt(req.query.chunkSize, 10) || 1024 * 1024; // Default 1MB
-    const absolutePath = path.join(FileService.uploadDirectory, filePath);
+    const fileRef = {
+        fileId: req.body.fileId || req.body.id || null,
+        filePath: req.body.filePath || req.body.path || null
+    };
+    const requestedRange = parseRangeHeader(req.headers.range);
+    const offset = requestedRange
+        ? requestedRange.start
+        : (parseInt(req.query.offset, 10) || 0);
+    const requestedChunkSize = requestedRange && requestedRange.end !== null
+        ? requestedRange.end - requestedRange.start + 1
+        : parseInt(req.query.chunkSize, 10);
+    const chunkSize = Number.isFinite(requestedChunkSize) && requestedChunkSize > 0
+        ? requestedChunkSize
+        : 1024 * 1024; // Default 1MB
 
     console.log('Download request:', {
-        filePath,
+        fileId: fileRef.fileId,
+        filePath: fileRef.filePath,
         offset,
-        chunkSize,
-        absolutePath
+        chunkSize
     });
 
     try {
-        if (!fs.existsSync(absolutePath)) {
-            console.error('File not found:', absolutePath);
-            return res.status(404).send('File not found.');
-        }
-
-        const stats = fs.statSync(absolutePath);
-        const fileSize = stats.size;
+        const download = await FileService.prepareDownload(req.userId, fileRef, offset, chunkSize, {
+            trackDownload: offset === 0
+        });
 
         // If offset equals file size, return a completed response
-        if (offset >= fileSize) {
+        if (offset >= download.fileSize) {
             console.log('Download complete - offset matches or exceeds file size:', {
                 offset,
-                fileSize
+                fileSize: download.fileSize
             });
             return res.status(204).end(); // No Content - indicates successful completion
         }
-
-        // Calculate end position for the chunk
-        const end = Math.min(offset + chunkSize - 1, fileSize - 1);
-        const contentLength = end - offset + 1;
         
         console.log('Chunk details:', {
-            fileSize,
-            start: offset,
-            end,
-            contentLength,
-            isLastChunk: end === fileSize - 1
+            fileSize: download.fileSize,
+            start: download.start,
+            end: download.end,
+            contentLength: download.contentLength,
+            isLastChunk: download.end === download.fileSize - 1
         });
-
-        const chunkStream = fs.createReadStream(absolutePath, { start: offset, end });
 
         res.writeHead(200, {
             'Content-Type': 'application/octet-stream',
-            'Content-Length': contentLength,
+            'Content-Length': download.contentLength,
             'Accept-Ranges': 'bytes',
-            'Content-Range': `bytes ${offset}-${end}/${fileSize}`
+            'Content-Range': `bytes ${download.start}-${download.end}/${download.fileSize}`
         });
 
-        chunkStream.pipe(res);
+        download.stream.pipe(res);
     } catch (error) {
         console.error('Error during download:', error);
-        res.status(500).send('Failed to download file.');
+        const status = error.message === 'Password verification required'
+            ? 401
+            : error.message === 'Download access denied' ? 403 : (error.statusCode || 500);
+        res.status(status).send(error.message || 'Failed to download file.');
     }
 };
 
 exports.getFileSize = async (req, res) => {
-    const filePath = path.join(FileService.uploadDirectory, req.body.filePath);
-    const absolutePath = path.resolve(filePath);
-
     try {
-        if (!fs.existsSync(absolutePath)) {
-            return res.status(404).send('File not found.');
-        }
-
-        const stats = fs.statSync(absolutePath);
-        res.json({ success: true, fileSize: stats.size });
+        const fileSize = await FileService.getStoredFileSizeByPath(req.userId, {
+            fileId: req.body.fileId || req.body.id || null,
+            filePath: req.body.filePath || req.body.path || null
+        });
+        res.json({ success: true, fileSize });
     } catch (error) {
         console.error('Error fetching file size:', error.message);
-        res.status(500).json({success: false, message: 'Failed to retrieve file size.'});
+        const status = error.message === 'Password verification required'
+            ? 401
+            : error.message === 'Download access denied' ? 403 : 500;
+        res.status(status).json({success: false, message: 'Failed to retrieve file size.'});
     }
 };
 
 exports.getUploadStatus = async (req, res) => {
-    const { filename } = req.query;
+    const { filename, folderId, totalChunks, fileSize, workspaceId } = req.query;
 
     try {
         if (!filename) {
@@ -366,7 +528,14 @@ exports.getUploadStatus = async (req, res) => {
         }
 
         // Query the database or storage system for uploaded chunks
-        const uploadStatus = await FileService.getUploadedChunks(filename, req.userId);
+        const uploadStatus = await FileService.getUploadedChunks(
+            filename,
+            req.userId,
+            folderId,
+            totalChunks,
+            fileSize,
+            { workspaceId }
+        );
 
         if (!uploadStatus) {
             return res.status(404).json({ success: true, message: 'No upload progress found for the specified file.' });
@@ -379,13 +548,73 @@ exports.getUploadStatus = async (req, res) => {
     }
 };
 
+exports.resetUpload = async (req, res) => {
+    const { filename, folderId, workspaceId } = req.body;
+
+    try {
+        if (!filename) {
+            return res.status(400).json({ success: false, message: 'Filename is required.' });
+        }
+
+        await FileService.cleanupPartialUpload(req.userId, filename, folderId, { workspaceId });
+        return res.status(200).json({ success: true, message: 'Upload session reset successfully.' });
+    } catch (error) {
+        console.error('Error resetting upload session:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to reset upload session.' });
+    }
+};
+
 exports.getFolderTree = async (req, res) => {
     try {
-        const tree = await FileService.getFolderTree(req.userId, req.query.parentId); // Start from root
+        const tree = await FileService.getFolderTree(req.userId, req.query.parentId, true, {
+            workspaceId: req.query.workspaceId || null
+        }); // Start from root
         res.status(200).json({ success: true, folders: tree });
     } catch (error) {
         console.error('Error fetching folder tree:', error);
         res.status(500).json({ success: false, message: 'Failed to fetch folder tree' });
+    }
+};
+
+exports.shareItem = async (req, res) => {
+    try {
+        const { itemId, isFolder, recipient, permission, expiresInHours, expiresInMinutes, workspaceId } = req.body;
+        const share = await FileService.shareItem(req.userId, itemId, !!isFolder, recipient, permission, {
+            expiresInHours,
+            expiresInMinutes,
+            workspaceId
+        });
+        res.status(201).json({ success: true, share });
+    } catch (error) {
+        console.error('Error sharing item:', error.message);
+        res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+exports.revokeShare = async (req, res) => {
+    try {
+        await FileService.revokeShare(req.userId, req.params.shareId);
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('Error revoking share:', error.message);
+        res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+exports.revokeItemShares = async (req, res) => {
+    try {
+        const itemType = req.params.itemType;
+        if (!['file', 'folder'].includes(itemType)) {
+            return res.status(400).json({ success: false, message: 'Invalid item type' });
+        }
+
+        const result = await FileService.revokeItemShares(req.userId, req.params.itemId, itemType === 'folder', {
+            workspaceId: req.query.workspaceId || req.body.workspaceId || null
+        });
+        res.status(200).json(result);
+    } catch (error) {
+        console.error('Error revoking item shares:', error.message);
+        res.status(400).json({ success: false, message: error.message });
     }
 };
 
@@ -429,7 +658,7 @@ exports.verifyPassword = async (req, res) => {
 
 exports.searchItems = async (req, res) => {
     try {
-        const { query } = req.query;
+        const { query, workspaceId } = req.query;
         console.log('Search query:', query);
         console.log('User:', req.userId);
 
@@ -437,7 +666,7 @@ exports.searchItems = async (req, res) => {
             return res.status(400).json({ message: 'Search query is required' });
         }
 
-        const results = await SearchService.searchItems(req.userId, query);
+        const results = await SearchService.searchItems(req.userId, query, 10, { workspaceId: workspaceId || null });
         console.log('Search results:', results);
         res.json({ results });
     } catch (error) {

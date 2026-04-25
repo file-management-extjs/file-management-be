@@ -4,12 +4,24 @@ const { init } = require('./socket');
 const fileRoutes = require('./routes/fileRoutes');
 const videoRoutes = require('./routes/videoRoutes');
 const imageRoutes = require('./routes/imageRoutes');
+const pdfStudioRoutes = require('./routes/pdfStudioRoutes');
+const mediaConversionRoutes = require('./routes/mediaConversionRoutes');
+const documentConversionRoutes = require('./routes/documentConversionRoutes');
+const contentIntelligenceRoutes = require('./routes/contentIntelligenceRoutes');
+const publicShareRoutes = require('./routes/publicShareRoutes');
+const organizationRoutes = require('./routes/organizationRoutes');
+const workspaceRoutes = require('./routes/workspaceRoutes');
 const auth = require('./middlewares/auth');
 const authRoutes = require('./routes/authRoutes');
 const connectDB = require('./config/db');
 const http = require('http');
 const scheduleAccessTimeout = require('./schedulers/accessTimeoutScheduler');
 const ScanningService = require('./services/scanningService');
+const ContentIntelligenceService = require('./services/contentIntelligenceService');
+const FileIndexService = require('./services/fileIndexService');
+require('./queues/mediaConversionQueue');
+require('./queues/documentConversionQueue');
+require('./queues/contentIntelligenceQueue');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -45,10 +57,15 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Connect to MongoDB
-connectDB().then(() => {
+connectDB().then(async () => {
+    await FileIndexService.ensureTextSearchIndex();
+
     // Initialize virus scanning service
     ScanningService.initialize();
     console.log('Virus scanning service initialized');
+
+    ContentIntelligenceService.initialize();
+    console.log('Content intelligence service initialized');
     
     // Start the scheduler after database connection is established
     scheduleAccessTimeout();
@@ -58,7 +75,7 @@ connectDB().then(() => {
         console.log(`Server is running on port ${PORT}`);
     });
 }).catch(err => {
-    console.error('Failed to connect to MongoDB:', err);
+    console.error('Failed to start backend:', err);
     process.exit(1);
 });
 
@@ -81,7 +98,14 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Routes
+app.use('/api/public/share', publicShareRoutes);
 app.use('/api/files', auth, fileRoutes);
+app.use('/api/workspaces', auth, workspaceRoutes);
+app.use('/api/organizations', auth, organizationRoutes);
 app.use('/api/video', auth, videoRoutes);
 app.use('/api/image', auth, imageRoutes);
+app.use('/api/pdf-studio', auth, pdfStudioRoutes);
+app.use('/api/media-conversion', auth, mediaConversionRoutes);
+app.use('/api/document-conversion', auth, documentConversionRoutes);
+app.use('/api/content-intelligence', auth, contentIntelligenceRoutes);
 app.use('/api/auth', authRoutes);

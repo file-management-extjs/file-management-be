@@ -1,0 +1,5 @@
+const ACCESS_VERIFICATION_WINDOW_MS = 30 * 60 * 1000;
+
+module.exports = {
+    ACCESS_VERIFICATION_WINDOW_MS
+};

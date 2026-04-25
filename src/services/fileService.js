@@ -1,6 +1,9 @@
 const File = require('../models/fileModel');
 const Folder = require('../models/folderModel');
 const UploadProgress = require('../models/uplodPrgress');
+const Share = require('../models/shareModel');
+const ShareLink = require('../models/shareLinkModel');
+const User = require('../models/userModel');
 const fs = require('fs-extra');
 const path = require('path');
 const mime = require('mime');
@@ -13,45 +16,728 @@ const CompressionService = require('./compressionService');
 const socket = require('../socket');
 const { fileEvents, EVENT_TYPES } = require('./eventService');
 const config = require('../config'); // Import config
+const { ACCESS_VERIFICATION_WINDOW_MS } = require('../constants/access');
+const StorageService = require('./storage/storageService');
+const SearchService = require('./searchService');
+const StorageInsightsService = require('./storageInsightsService');
+const OrganizationShareService = require('./organizationShareService');
+const ActivityEventService = require('./activityEventService');
+const WorkspaceService = require('./workspaceService');
 
 class FileService {
-    static uploadDirectory = path.join(__dirname, '../../public/uploads');
+    static uploadDirectory = config.storage.localRoot;
+    static tempDirectory = config.storage.tempRoot;
     static ongoingCompressions = new Map();
 
-    static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks) {
-        let uploadDir = FileService.uploadDirectory;
-        let relativeUploadDir = '';
+    static async resolveWorkspaceContext(userId, workspaceId = null, options = {}) {
+        return WorkspaceService.assertWorkspaceAccess(userId, workspaceId, options);
+    }
 
-        if (folderId) {
-            let folder = await Folder.findById(folderId);
-            if (folder) {
-                uploadDir = path.join(uploadDir, folder.path);
-                relativeUploadDir = folder.path;
+    static async getWorkspaceContextFromOptions(userId, options = {}) {
+        if (options.workspaceContext && options.workspaceContext.workspace) {
+            return options.workspaceContext;
+        }
+
+        return this.resolveWorkspaceContext(userId, options.workspaceId || null, options);
+    }
+
+    static getWorkspaceItemPatch(workspaceContext, userId) {
+        return WorkspaceService.getWorkspacePatch(workspaceContext.workspace, userId);
+    }
+
+    static getScopedItemQuery(workspaceContext, extra = {}) {
+        return WorkspaceService.getItemScopeQuery(workspaceContext.workspace, extra);
+    }
+
+    static getStorageInsightKey(workspaceContext, userId) {
+        return workspaceContext && workspaceContext.workspace
+            ? workspaceContext.workspace._id.toString()
+            : userId;
+    }
+
+    static createServiceError(message, statusCode = 400) {
+        const error = new Error(message);
+        error.statusCode = statusCode;
+        return error;
+    }
+
+    static escapeRegExp(value) {
+        return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    static hasValidRecentAccess(item, userId) {
+        const userAccess = item.userAccess.find(
+            access => access.userId === userId.toString()
+        );
+
+        const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
+        return !!lastAccessed && (Date.now() - lastAccessed.getTime()) <= ACCESS_VERIFICATION_WINDOW_MS;
+    }
+
+    static assertPasswordAccess(item, userId) {
+        if (item.isPasswordProtected && !this.hasValidRecentAccess(item, userId)) {
+            throw new Error('Password verification required');
+        }
+    }
+
+    static getActiveShareFilter(recipientId, extra = {}) {
+        return {
+            recipientId: recipientId.toString(),
+            revoked: false,
+            approvalStatus: { $nin: ['pending', 'rejected'] },
+            $and: [
+                {
+                    $or: [
+                        { expiresAt: null },
+                        { expiresAt: { $gt: new Date() } }
+                    ]
+                }
+            ],
+            ...extra
+        };
+    }
+
+    static getPersonalShareScopeFilter() {
+        return {
+            $or: [
+                { organizationId: null },
+                { organizationId: '' },
+                { organizationId: { $exists: false } }
+            ]
+        };
+    }
+
+    static getActiveOutgoingShareFilter(ownerId, extra = {}) {
+        return {
+            ownerId: ownerId.toString(),
+            revoked: false,
+            $and: [
+                {
+                    $or: [
+                        { expiresAt: null },
+                        { expiresAt: { $gt: new Date() } }
+                    ]
+                }
+            ],
+            ...extra
+        };
+    }
+
+    static getOutgoingShareManagementFilter(ownerId, extra = {}) {
+        return {
+            ownerId: ownerId.toString(),
+            revoked: false,
+            ...extra
+        };
+    }
+
+    static getActiveShareLinkFilter(ownerId, extra = {}) {
+        return {
+            ownerId: ownerId.toString(),
+            revoked: false,
+            $and: [
+                {
+                    $or: [
+                        { expiresAt: null },
+                        { expiresAt: { $gt: new Date() } }
+                    ]
+                }
+            ],
+            ...extra
+        };
+    }
+
+    static getShareLinkManagementFilter(ownerId, extra = {}) {
+        return {
+            ownerId: ownerId.toString(),
+            revoked: false,
+            ...extra
+        };
+    }
+
+    static getExpiryDate(expiryOptions = {}) {
+        const options = typeof expiryOptions === 'object'
+            ? expiryOptions
+            : { expiresInHours: expiryOptions };
+        const minutes = Number(options.expiresInMinutes);
+
+        if (Number.isFinite(minutes) && minutes > 0) {
+            return new Date(Date.now() + Math.min(minutes, 365 * 24 * 60) * 60 * 1000);
+        }
+
+        const expiresInHours = options.expiresInHours;
+        const hours = Number(expiresInHours);
+
+        if (!Number.isFinite(hours) || hours <= 0) {
+            return null;
+        }
+
+        return new Date(Date.now() + Math.min(hours, 24 * 365) * 60 * 60 * 1000);
+    }
+
+    static async hasDirectShare(userId, itemId, itemType) {
+        return !!await Share.findOne(this.getActiveShareFilter(userId, {
+            itemId: itemId.toString(),
+            itemType
+        })).lean();
+    }
+
+    static async getDirectShare(userId, itemId, itemType) {
+        return Share.findOne(this.getActiveShareFilter(userId, {
+            itemId: itemId.toString(),
+            itemType,
+            ...this.getPersonalShareScopeFilter()
+        })).lean();
+    }
+
+    static async getSharedAncestorShare(userId, item) {
+        let currentFolderId = item.parent_id;
+
+        while (currentFolderId) {
+            const folder = await Folder.findOne({ _id: currentFolderId, deleted: false })
+                .select('_id parent_id')
+                .lean();
+
+            if (!folder) {
+                return false;
             }
-        } else {
-            uploadDir = path.join(uploadDir, userId);
+
+            const share = await this.getDirectShare(userId, folder._id, 'folder');
+            if (share) {
+                return share;
+            }
+
+            currentFolderId = folder.parent_id;
         }
 
-        // Ensure chunk directory exists
+        return null;
+    }
+
+    static async hasSharedAncestor(userId, item) {
+        return !!await this.getSharedAncestorShare(userId, item) ||
+            !!await OrganizationShareService.getSharedAncestorShare(userId, item);
+    }
+
+    static async getAccessShare(userId, item, itemType) {
+        const directShare = await this.getDirectShare(userId, item._id, itemType);
+        return directShare ||
+            await OrganizationShareService.getAccessShareForItem(userId, item, itemType) ||
+            await this.getSharedAncestorShare(userId, item);
+    }
+
+    static async canAccessFile(userId, file) {
+        if (!file || file.deleted) {
+            return false;
+        }
+
+        if (file.userId.toString() === userId.toString()) {
+            return true;
+        }
+
+        if (file.workspaceType === 'organization' && file.organizationId) {
+            const membership = await WorkspaceService.getOrganizationMembership(userId, file.organizationId);
+            if (membership) {
+                return true;
+            }
+        }
+
+        return !!await this.getAccessShare(userId, file, 'file');
+    }
+
+    static async canDownloadFile(userId, file) {
+        if (!file || file.deleted) {
+            return false;
+        }
+
+        if (file.userId.toString() === userId.toString()) {
+            return true;
+        }
+
+        if (file.workspaceType === 'organization' && file.organizationId) {
+            const membership = await WorkspaceService.getOrganizationMembership(userId, file.organizationId);
+            if (membership) {
+                return true;
+            }
+        }
+
+        const share = await this.getAccessShare(userId, file, 'file');
+        return OrganizationShareService.shareAllowsPermission(share, 'download');
+    }
+
+    static async recordDownloadAccess(userId, file) {
+        if (!file || file.deleted || file.userId.toString() === userId.toString()) {
+            return null;
+        }
+
+        if (file.workspaceType === 'organization' && file.organizationId) {
+            const membership = await WorkspaceService.getOrganizationMembership(userId, file.organizationId);
+            if (membership) {
+                return null;
+            }
+        }
+
+        const share = await this.getAccessShare(userId, file, 'file');
+        if (!share) {
+            return null;
+        }
+
+        if (!OrganizationShareService.shareAllowsPermission(share, 'download')) {
+            throw this.createServiceError('Download access denied', 403);
+        }
+
+        return OrganizationShareService.recordDownloadAccess(share);
+    }
+
+    static async canAccessFolder(userId, folder) {
+        if (!folder || folder.deleted) {
+            return false;
+        }
+
+        if (folder.userId.toString() === userId.toString()) {
+            return true;
+        }
+
+        if (folder.workspaceType === 'organization' && folder.organizationId) {
+            const membership = await WorkspaceService.getOrganizationMembership(userId, folder.organizationId);
+            if (membership) {
+                return true;
+            }
+        }
+
+        return !!await this.getAccessShare(userId, folder, 'folder');
+    }
+
+    static async getAccessibleFileById(userId, fileId) {
+        const file = await File.findOne({ _id: fileId, deleted: false });
+        return await this.canAccessFile(userId, file) ? file : null;
+    }
+
+    static async getAccessibleFolderById(userId, folderId) {
+        const folder = await Folder.findOne({ _id: folderId, deleted: false });
+        return await this.canAccessFolder(userId, folder) ? folder : null;
+    }
+
+    static async decorateSharedItem(item, recipientId, itemType = null) {
+        const isOwner = item.userId.toString() === recipientId.toString();
+        if (isOwner) {
+            return { isShared: false };
+        }
+
+        const owner = await User.findById(item.userId).select('username email').lean();
+        const share = itemType ? await this.getAccessShare(recipientId, item, itemType) : null;
+
+        return {
+            isShared: true,
+            ownerId: item.userId.toString(),
+            sharedBy: owner ? owner.username : 'Unknown user',
+            permission: share ? share.permission : undefined,
+            shareId: share ? share._id.toString() : undefined
+        };
+    }
+
+    static async decorateOutgoingShareItem(item, viewerId, itemType) {
+        if (!itemType || item.userId.toString() !== viewerId.toString()) {
+            return {};
+        }
+
+        const [shares, publicLinks] = await Promise.all([
+            Share.find(this.getActiveOutgoingShareFilter(viewerId, {
+                itemId: item._id.toString(),
+                itemType
+            })).sort({ updatedAt: -1 }).lean(),
+            ShareLink.find(this.getActiveShareLinkFilter(viewerId, {
+                itemId: item._id.toString(),
+                itemType
+            })).sort({ updatedAt: -1 }).lean()
+        ]);
+
+        if (!shares.length && !publicLinks.length) {
+            return {
+                isSharedByMe: false,
+                shareCount: 0,
+                outgoingShareIds: [],
+                publicLinkIds: []
+            };
+        }
+
+        const recipientIds = shares
+            .filter(share => !share.targetType || share.targetType === 'member')
+            .map(share => share.recipientId);
+        const recipients = await User.find({ _id: { $in: recipientIds } }).select('_id username email').lean();
+        const recipientById = recipients.reduce((result, recipient) => {
+            result[recipient._id.toString()] = recipient;
+            return result;
+        }, {});
+        const recipientNames = shares.map(share => {
+            if (share.targetLabel) {
+                return share.targetLabel;
+            }
+
+            if (share.targetType === 'team') {
+                return 'Team share';
+            }
+
+            if (share.targetType === 'organization') {
+                return 'Organization share';
+            }
+
+            if (share.targetType === 'external') {
+                return share.recipientId;
+            }
+
+            const recipient = recipientById[share.recipientId];
+            return recipient ? recipient.username : 'Unknown user';
+        });
+        const targetNames = recipientNames.concat(publicLinks.length ? ['Anyone with link'] : []);
+        const sharedWith = targetNames.length === 1
+            ? targetNames[0]
+            : `${targetNames[0]} + ${targetNames.length - 1} more`;
+
+        return {
+            isSharedByMe: true,
+            shareCount: shares.length + publicLinks.length,
+            outgoingShareIds: shares.map(share => share._id.toString()),
+            hasPublicLink: publicLinks.length > 0,
+            publicLinkCount: publicLinks.length,
+            publicLinkIds: publicLinks.map(link => link._id.toString()),
+            sharedWith,
+            sharedWithList: targetNames.join(', ')
+        };
+    }
+
+    static async prepareSharedFileForRecipient(file, recipientId) {
+        if (!file || file.deleted) {
+            return null;
+        }
+
+        if (file.scanStatus === 'infected') {
+            return null;
+        }
+
+        if (file.userId.toString() === recipientId.toString() ||
+            !config.virusScanning?.enabled ||
+            file.scanStatus === 'clean') {
+            return file;
+        }
+
+        const ScanningService = require('./scanningService');
+        await ScanningService.ensureFileScanQueued(file, {
+            notifyUserIds: [file.userId.toString(), recipientId.toString()]
+        });
+
+        return null;
+    }
+
+    static async assertSharedFileReadyForAccess(file, requesterId) {
+        if (!file) {
+            return;
+        }
+
+        if (file.userId.toString() === requesterId.toString()) {
+            return;
+        }
+
+        if (file.scanStatus === 'infected') {
+            throw this.createServiceError('This shared file failed virus scanning and is not available.', 410);
+        }
+
+        if (!config.virusScanning?.enabled || file.scanStatus === 'clean') {
+            return;
+        }
+
+        const ScanningService = require('./scanningService');
+        await ScanningService.ensureFileScanQueued(file, {
+            notifyUserIds: [file.userId.toString(), requesterId.toString()]
+        });
+
+        throw this.createServiceError('This shared file is being scanned for viruses. Please try again after the scan completes.', 409);
+    }
+
+    static getFileCategory(mimetype = '') {
+        const normalizedType = String(mimetype || '');
+
+        if (!normalizedType) return 'Other';
+        if (normalizedType.startsWith('image/')) return 'Images';
+        if (normalizedType.startsWith('video/')) return 'Videos';
+        if (normalizedType.startsWith('audio/')) return 'Audio';
+        if (normalizedType.startsWith('text/')) return 'Text';
+        if (normalizedType === 'application/pdf') return 'Documents';
+        if (normalizedType.includes('word') || normalizedType.includes('excel') || normalizedType.includes('powerpoint')) return 'Documents';
+        if (normalizedType.includes('spreadsheet') || normalizedType.includes('presentation')) return 'Documents';
+        if (normalizedType.includes('zip') || normalizedType.includes('rar') || normalizedType.includes('7z') || normalizedType.includes('tar')) return 'Archives';
+        return 'Other';
+    }
+
+    static getFileCategoryIcon(category) {
+        const icons = {
+            Images: 'fa fa-image green-icon',
+            Videos: 'fa fa-film blue-icon',
+            Audio: 'fa fa-music blue-icon',
+            Text: 'fa fa-file-lines',
+            Documents: 'fa fa-file-pdf red-icon',
+            Archives: 'fa fa-file-archive yellow-icon',
+            Other: 'fa fa-file'
+        };
+
+        return icons[category] || icons.Other;
+    }
+
+    static async buildFolderAncestors(userId, folderId, options = {}) {
+        const ancestors = [];
+        let currentFolderId = folderId;
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options).catch(() => null);
+        const workspaceId = workspaceContext && workspaceContext.workspace
+            ? workspaceContext.workspace._id.toString()
+            : null;
+
+        while (currentFolderId) {
+            const query = {
+                _id: currentFolderId,
+                deleted: false
+            };
+
+            if (workspaceId) {
+                query.workspaceId = workspaceId;
+            } else {
+                query.userId = userId;
+            }
+
+            const folder = await Folder.findOne(query)
+                .select('_id name parent_id')
+                .lean();
+
+            if (!folder) {
+                break;
+            }
+
+            ancestors.unshift({
+                id: folder._id.toString(),
+                name: folder.name
+            });
+
+            currentFolderId = folder.parent_id;
+        }
+
+        return ancestors;
+    }
+
+    static async buildFolderAncestorsFromItemScope(item, folderId) {
+        const ancestors = [];
+        let currentFolderId = folderId;
+        const scope = item && item.workspaceId
+            ? { workspaceId: item.workspaceId }
+            : { userId: item.userId ? item.userId.toString() : '' };
+
+        while (currentFolderId) {
+            const folder = await Folder.findOne({
+                _id: currentFolderId,
+                ...scope,
+                deleted: false
+            }).select('_id name parent_id').lean();
+
+            if (!folder) {
+                break;
+            }
+
+            ancestors.unshift({
+                id: folder._id.toString(),
+                name: folder.name
+            });
+
+            currentFolderId = folder.parent_id;
+        }
+
+        return ancestors;
+    }
+
+    static normalizeFolderId(folderId) {
+        return folderId || null;
+    }
+
+    static getUploadProgressFilter(userId, filename, folderId = null, workspaceContext = null) {
+        return {
+            userId,
+            ...(workspaceContext && workspaceContext.workspace ? {
+                workspaceId: workspaceContext.workspace._id.toString()
+            } : {}),
+            filename,
+            folderId: this.normalizeFolderId(folderId)
+        };
+    }
+
+    static getChunkDir(uploadDir, fileName) {
+        return path.join(uploadDir, '.chunks', encodeURIComponent(fileName));
+    }
+
+    static getChunkNumbers(chunkDir) {
+        if (!fs.existsSync(chunkDir)) {
+            return [];
+        }
+
+        return fs.readdirSync(chunkDir)
+            .map((entry) => {
+                const match = entry.match(/^chunk_(\d+)$/);
+                return match ? parseInt(match[1], 10) : null;
+            })
+            .filter((chunkNumber) => Number.isInteger(chunkNumber))
+            .sort((a, b) => a - b);
+    }
+
+    static getStorageKey(file) {
+        return StorageService.getFileKey(file);
+    }
+
+    static getLogicalFilePath(userId, relativeUploadDir, filename) {
+        return path.join(relativeUploadDir || userId, filename);
+    }
+
+    static async getFileStream(fileOrPath, options = {}) {
+        try {
+            if (typeof fileOrPath === 'string') {
+                await fs.access(fileOrPath);
+
+                return {
+                    stream: fs.createReadStream(fileOrPath, options),
+                    mimetype: mime.getType(fileOrPath)
+                };
+            }
+
+            const stream = await StorageService.createReadStream(fileOrPath, options);
+            return {
+                stream,
+                mimetype: fileOrPath.mimetype || mime.getType(fileOrPath.name)
+            };
+        } catch (error) {
+            throw new Error('File not found or inaccessible');
+        }
+    }
+
+    static async getStoredFileSize(file) {
+        const stats = await StorageService.statFile(file);
+        return stats.size;
+    }
+
+    static getTempPath(...parts) {
+        return path.join(this.tempDirectory, ...parts);
+    }
+
+    static async materializeFile(file, filename = null) {
+        const safeName = filename || file.name || path.basename(file.path);
+        const tempPath = this.getTempPath(
+            'materialized',
+            file.userId.toString(),
+            file._id.toString(),
+            safeName
+        );
+
+        return StorageService.materializeFile(file, tempPath);
+    }
+
+    static async materializeFolder(folder, destinationPath) {
+        await fs.ensureDir(destinationPath);
+
+        const [files, subfolders] = await Promise.all([
+            File.find({
+                parent_id: folder._id.toString(),
+                workspaceId: folder.workspaceId || null,
+                deleted: false
+            }),
+            Folder.find({
+                parent_id: folder._id.toString(),
+                workspaceId: folder.workspaceId || null,
+                deleted: false
+            })
+        ]);
+
+        for (const file of files) {
+            const destinationFilePath = path.join(destinationPath, file.name);
+            const materializedPath = await StorageService.materializeFile(file, destinationFilePath);
+            if (materializedPath !== destinationFilePath) {
+                await fs.copy(materializedPath, destinationFilePath);
+            }
+        }
+
+        for (const subfolder of subfolders) {
+            await this.materializeFolder(subfolder, path.join(destinationPath, subfolder.name));
+        }
+
+        return destinationPath;
+    }
+
+    static async getRelativeUploadDir(userId, parentId = null, folder = '', options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        const workspace = workspaceContext.workspace;
+
+        if (parentId) {
+            const parentFolder = await Folder.findById(parentId);
+            if (!parentFolder || parentFolder.workspaceId !== workspace._id.toString()) {
+                throw new Error('Parent folder not found or access denied');
+            }
+
+            return parentFolder.path;
+        }
+
+        return folder ? path.join(workspace.rootPath, folder) : workspace.rootPath;
+    }
+
+    static async resolveUploadTarget(userId, folderId = null, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const workspace = workspaceContext.workspace;
+        const normalizedFolderId = this.normalizeFolderId(folderId);
+
+        if (!normalizedFolderId) {
+            return {
+                uploadDir: StorageService.isObjectStorage()
+                    ? this.getTempPath('chunks', workspace._id.toString(), userId.toString())
+                    : path.join(this.uploadDirectory, workspace.rootPath),
+                relativeUploadDir: workspace.rootPath,
+                folderId: null,
+                workspaceContext
+            };
+        }
+
+        const folder = await Folder.findById(normalizedFolderId);
+        if (!folder || folder.workspaceId !== workspace._id.toString()) {
+            throw new Error('Target folder not found or access denied');
+        }
+
+        return {
+            uploadDir: StorageService.isObjectStorage()
+                ? this.getTempPath('chunks', workspace._id.toString(), normalizedFolderId)
+                : path.join(this.uploadDirectory, folder.path),
+            relativeUploadDir: folder.path,
+            folderId: normalizedFolderId,
+            workspaceContext
+        };
+    }
+
+    static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks, options = {}) {
+        const {
+            uploadDir,
+            relativeUploadDir,
+            folderId: normalizedFolderId,
+            workspaceContext
+        } = await this.resolveUploadTarget(userId, folderId, options);
+        const chunkDir = this.getChunkDir(uploadDir, fileName);
+
         fs.mkdirSync(uploadDir, { recursive: true });
-
-        // Save the chunk
-        let chunkDir = path.join(uploadDir, `chunks`);
-
-        if(!fs.existsSync(chunkDir)) {
-            fs.mkdirSync(chunkDir, { recursive: true });
-        }
+        fs.mkdirSync(chunkDir, { recursive: true });
 
         const chunkPath = path.join(chunkDir, `chunk_${currentChunk}`);
         fs.writeFileSync(chunkPath, chunk.buffer);
 
         // If all chunks are uploaded, combine them
         if (parseInt(currentChunk) >= parseInt(totalChunks)) {
-            return await this.combineChunks(chunkDir, uploadDir, relativeUploadDir, fileName, userId, folderId);
+            return await this.combineChunks(chunkDir, uploadDir, relativeUploadDir, fileName, userId, normalizedFolderId, {
+                workspaceContext
+            });
         }
     }
 
-    static async combineChunks(chunkDir, uploadDir, relativeUploadDir, filename, userId, parentId) {
+    static async combineChunks(chunkDir, uploadDir, relativeUploadDir, filename, userId, parentId, options = {}) {
         try {
             const targetPath = path.join(uploadDir, filename);
             const chunks = fs.readdirSync(chunkDir).sort((a, b) => {
@@ -70,21 +756,31 @@ class FileService {
                 fs.unlinkSync(chunkPath); // Remove chunk after appending
             }
 
-            writeStream.end();
+            await new Promise((resolve, reject) => {
+                writeStream.on('finish', resolve);
+                writeStream.on('error', reject);
+                writeStream.end();
+            });
 
-            const file = await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream);
+            const file = await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, {
+                requiresVirusScan: true,
+                workspaceContext: options.workspaceContext
+            });
 
-            this.recalculateFolderStats(parentId);
+            await this.recalculateFolderStats(parentId);
 
             // Remove the chunks directory
-            fs.rmdirSync(chunkDir);
+            await fs.remove(chunkDir);
 
             // Emit file uploaded event after file is saved
-            fileEvents.emit(EVENT_TYPES.FILE_UPLOADED, {
-                fileId: file._id,
-                userId,
-                filePath: file.path
-            });
+	            fileEvents.emit(EVENT_TYPES.FILE_UPLOADED, {
+	                fileId: file._id,
+	                userId,
+	                fileName: file.name,
+	                filePath: file.path,
+	                parentId: file.parent_id,
+                    workspaceId: file.workspaceId || null
+	            });
 
             console.log(`File ${filename} successfully combined and saved.`);
 
@@ -115,6 +811,18 @@ class FileService {
 
     static calculateTotalSize(items, userId) {
         let totalSize = 0;
+
+        if (StorageService.isObjectStorage()) {
+            items.forEach(async (item) => {
+                const Model = item.type === 'folder' ? Folder : File;
+                const record = await Model.findById(item.id);
+                if (record && record.userId.toString() === userId.toString()) {
+                    totalSize += record.size || 0;
+                }
+            });
+
+            return totalSize;
+        }
 
         items.forEach(async (item) => {
             try {
@@ -148,15 +856,314 @@ class FileService {
         return totalSize;
     }
 
-    static async *streamFilesGenerator(userId, parentId = null, search = null) {
+    static async serializeFolder(folder, viewerId, extra = {}) {
+        const childScope = {
+            parent_id: folder._id.toString(),
+            deleted: false,
+            ...(folder.workspaceId ? { workspaceId: folder.workspaceId } : { userId: folder.userId.toString() })
+        };
+        const childCount = await Folder.countDocuments(childScope) +
+            await File.countDocuments({
+                ...childScope,
+                scanStatus: {$in: [null, 'clean']}
+            });
+        const isLocked = folder.isPasswordProtected &&
+            !folder.userAccess.some(access => access.userId === viewerId.toString());
+        const shared = await this.decorateSharedItem(folder, viewerId, 'folder');
+        const outgoingShare = await this.decorateOutgoingShareItem(folder, viewerId, 'folder');
+        const ancestors = Array.isArray(extra.ancestors)
+            ? extra.ancestors
+            : await this.buildFolderAncestorsFromItemScope(folder, folder._id);
+
+        return {
+            id: folder._id.toString(),
+            name: folder.name,
+            isFolder: true,
+            hasChildren: childCount > 0,
+            parent_id: folder.parent_id ? folder.parent_id.toString() : null,
+            workspaceId: folder.workspaceId || null,
+            workspaceType: folder.workspaceType || null,
+            organizationId: folder.organizationId || null,
+            createdByUserId: folder.createdByUserId || folder.userId,
+            ownerId: folder.userId,
+            ancestors,
+            isLocked,
+            isPasswordProtected: folder.isPasswordProtected,
+            size: folder.size,
+            createdAt: folder.createdAt,
+            path: folder.path,
+            ...shared,
+            ...outgoingShare,
+            ...extra
+        };
+    }
+
+    static async serializeFile(file, viewerId, extra = {}) {
+        const isLocked = file.isPasswordProtected &&
+            !file.userAccess.some(access => access.userId === viewerId.toString());
+        const shared = await this.decorateSharedItem(file, viewerId, 'file');
+        const outgoingShare = await this.decorateOutgoingShareItem(file, viewerId, 'file');
+
+        return {
+            id: file._id.toString(),
+            name: file.name,
+            isFolder: false,
+            parent_id: file.parent_id ? file.parent_id.toString() : null,
+            workspaceId: file.workspaceId || null,
+            workspaceType: file.workspaceType || null,
+            organizationId: file.organizationId || null,
+            createdByUserId: file.createdByUserId || file.userId,
+            ownerId: file.userId,
+            size: file.size,
+            createdAt: file.createdAt,
+            mimetype: file.mimetype,
+            type: file.mimetype ? file.mimetype.split('/')[0] : 'unknown',
+            path: file.path,
+            scanStatus: file.scanStatus || null,
+            scanProgress: file.scanProgress || 0,
+            scanResult: file.scanResult || null,
+            scanDate: file.scanDate || null,
+            contentIntelligence: file.contentIntelligence ? {
+                status: file.contentIntelligence.status || null,
+                stage: file.contentIntelligence.stage || null,
+                progress: file.contentIntelligence.progress || 0,
+                textExcerpt: file.contentIntelligence.textExcerpt || '',
+                language: file.contentIntelligence.language || null,
+                classification: file.contentIntelligence.classification || null,
+                tags: file.contentIntelligence.tags || [],
+                summary: file.contentIntelligence.summary || '',
+                provider: file.contentIntelligence.provider || null,
+                model: file.contentIntelligence.model || null,
+                extractionMethod: file.contentIntelligence.extractionMethod || null,
+                ocrApplied: file.contentIntelligence.ocrApplied === true,
+                imageRecognized: file.contentIntelligence.imageRecognized === true,
+                error: file.contentIntelligence.error || null,
+                lastRunAt: file.contentIntelligence.lastRunAt || null,
+                completedAt: file.contentIntelligence.completedAt || null
+            } : null,
+            isLocked,
+            isPasswordProtected: file.isPasswordProtected,
+            ...shared,
+            ...outgoingShare,
+            ...extra
+        };
+    }
+
+    static async *streamSharedFilesGenerator(userId, parentId = null, search = null) {
+        if (!parentId) {
+            const shares = await OrganizationShareService.getSharesForUser(userId);
+
+            for (const share of shares) {
+                const Model = share.itemType === 'folder' ? Folder : File;
+                const item = await Model.findOne({
+                    _id: share.itemId,
+                    deleted: false
+                });
+
+                if (!item) {
+                    continue;
+                }
+
+                if (share.itemType === 'file') {
+                    const visibleFile = await this.prepareSharedFileForRecipient(item, userId);
+                    if (!visibleFile) {
+                        continue;
+                    }
+                }
+
+                if (search && !new RegExp(this.escapeRegExp(search), 'i').test(item.name)) {
+                    continue;
+                }
+
+                const shareMeta = {
+                    isShared: true,
+                    shareId: share._id.toString(),
+                    permission: share.permission
+                };
+
+                yield share.itemType === 'folder'
+                    ? await this.serializeFolder(item, userId, shareMeta)
+                    : await this.serializeFile(item, userId, shareMeta);
+            }
+
+            return;
+        }
+
+        const parentFolder = await this.getAccessibleFolderById(userId, parentId);
+        if (!parentFolder) {
+            throw new Error('Shared folder not found or access denied');
+        }
+        this.assertPasswordAccess(parentFolder, userId);
+
+        const foldersQuery = {
+            ...(parentFolder.workspaceId ? { workspaceId: parentFolder.workspaceId } : { userId: parentFolder.userId }),
+            parent_id: parentId,
+            deleted: false
+        };
+        const filesQuery = {
+            ...(parentFolder.workspaceId ? { workspaceId: parentFolder.workspaceId } : { userId: parentFolder.userId }),
+            parent_id: parentId,
+            deleted: false
+        };
+
+        if (search) {
+            foldersQuery.name = new RegExp(this.escapeRegExp(search), 'i');
+            filesQuery.name = new RegExp(this.escapeRegExp(search), 'i');
+        }
+
+        const foldersStream = Folder.find(foldersQuery).cursor();
+        for await (const folder of foldersStream) {
+            yield await this.serializeFolder(folder, userId, { isShared: true });
+        }
+
+        const filesStream = File.find(filesQuery).cursor();
+        for await (const file of filesStream) {
+            const visibleFile = await this.prepareSharedFileForRecipient(file, userId);
+            if (!visibleFile) {
+                continue;
+            }
+
+            yield await this.serializeFile(visibleFile, userId, { isShared: true });
+        }
+    }
+
+    static async *streamSharedByMeGenerator(userId, search = null) {
+        const now = new Date();
+        const [shares, publicLinks] = await Promise.all([
+            Share.find(this.getOutgoingShareManagementFilter(userId)).sort({ updatedAt: -1 }).lean(),
+            ShareLink.find(this.getShareLinkManagementFilter(userId)).sort({ updatedAt: -1 }).lean()
+        ]);
+        const matcher = search ? new RegExp(this.escapeRegExp(search), 'i') : null;
+
+        for (const share of shares) {
+            const Model = share.itemType === 'folder' ? Folder : File;
+            const item = await Model.findOne({
+                _id: share.itemId,
+                userId: userId.toString()
+            });
+
+            if (!item) {
+                continue;
+            }
+
+            const targetType = share.targetType || 'member';
+            const recipient = targetType === 'member'
+                ? await User.findById(share.recipientId).select('_id username email').lean()
+                : null;
+            const recipientName = share.targetLabel ||
+                (recipient ? recipient.username : (
+                    targetType === 'team'
+                        ? 'Team share'
+                        : targetType === 'organization'
+                            ? 'Organization share'
+                            : targetType === 'external'
+                                ? share.recipientId
+                                : 'Unknown user'
+                ));
+            const recipientEmail = recipient ? recipient.email : '';
+
+            if (matcher &&
+                !matcher.test(item.name) &&
+                !matcher.test(recipientName) &&
+                !matcher.test(recipientEmail)) {
+                continue;
+            }
+
+            const shareMeta = {
+                isSharedByMe: true,
+                shareId: share._id.toString(),
+                recipientId: recipient ? recipient._id.toString() : share.recipientId,
+                recipientUsername: recipientName,
+                recipientEmail,
+                shareTargetType: targetType,
+                sharedWith: recipientEmail && !share.targetLabel ? `${recipientName} <${recipientEmail}>` : recipientName,
+                sharedWithList: recipientEmail && !share.targetLabel ? `${recipientName} <${recipientEmail}>` : recipientName,
+                permission: share.permission,
+                shareStatus: item.deleted ? 'Item deleted' : (share.expiresAt && share.expiresAt <= now ? 'Expired' : 'Active'),
+                itemDeleted: item.deleted === true,
+                sharedAt: share.createdAt,
+                shareUpdatedAt: share.updatedAt,
+                expiresAt: share.expiresAt,
+                maxDownloads: share.maxDownloads || null,
+                downloadCount: share.downloadCount || 0,
+                lastDownloadedAt: share.lastDownloadedAt || null
+            };
+
+            yield share.itemType === 'folder'
+                ? await this.serializeFolder(item, userId, shareMeta)
+                : await this.serializeFile(item, userId, shareMeta);
+        }
+
+        for (const publicLink of publicLinks) {
+            const Model = publicLink.itemType === 'folder' ? Folder : File;
+            const item = await Model.findOne({
+                _id: publicLink.itemId,
+                userId: userId.toString()
+            });
+
+            if (!item) {
+                continue;
+            }
+
+            if (matcher &&
+                !matcher.test(item.name) &&
+                !matcher.test('Anyone with link')) {
+                continue;
+            }
+
+            const publicLinkMeta = {
+                isSharedByMe: true,
+                shareKind: 'publicLink',
+                hasPublicLink: true,
+                publicLinkId: publicLink._id.toString(),
+                publicLinkIds: [publicLink._id.toString()],
+                publicLinkCount: 1,
+                shareCount: 1,
+                sharedWith: 'Anyone with link',
+                sharedWithList: 'Anyone with link',
+                permission: publicLink.permission,
+                shareStatus: item.deleted ? 'Item deleted' : (publicLink.expiresAt && publicLink.expiresAt <= now ? 'Expired' : 'Active'),
+                itemDeleted: item.deleted === true,
+                sharedAt: publicLink.createdAt,
+                shareUpdatedAt: publicLink.updatedAt,
+                expiresAt: publicLink.expiresAt,
+                accessCount: publicLink.accessCount || 0,
+                maxDownloads: publicLink.maxDownloads || null,
+                downloadCount: publicLink.downloadCount || 0,
+                lastDownloadedAt: publicLink.lastDownloadedAt,
+                lastAccessedAt: publicLink.lastAccessedAt,
+                tokenPreview: publicLink.tokenPreview
+            };
+
+            yield publicLink.itemType === 'folder'
+                ? await this.serializeFolder(item, userId, publicLinkMeta)
+                : await this.serializeFile(item, userId, publicLinkMeta);
+        }
+    }
+
+    static async *streamFilesGenerator(userId, parentId = null, search = null, options = {}) {
         try {
+            if (options.sharedByMe) {
+                yield* this.streamSharedByMeGenerator(userId, search);
+                return;
+            }
+
+            if (options.shared) {
+                yield* this.streamSharedFilesGenerator(userId, parentId, search);
+                return;
+            }
+
+            const includeFileAncestors = Boolean(search);
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+            const workspaceId = workspaceContext.workspace._id.toString();
+
             let foldersQuery = { 
-                userId, 
+                workspaceId,
                 deleted: false
             };
 
             let filesQuery = {
-                userId,
+                workspaceId,
                 deleted: false,
                 scanStatus: {$in: [null, 'clean']}
             };
@@ -169,51 +1176,42 @@ class FileService {
 
             // Add search filter if provided
             if (search) {
-                foldersQuery.name = new RegExp(search, 'i');
+                const searchRegex = new RegExp(this.escapeRegExp(search), 'i');
+                foldersQuery.name = searchRegex;
+                filesQuery.$or = [
+                    { name: searchRegex },
+                    { path: searchRegex },
+                    { 'contentIntelligence.searchableText': searchRegex },
+                    { 'contentIntelligence.tags': searchRegex },
+                    { 'contentIntelligence.classification': searchRegex },
+                    { 'contentIntelligence.summary': searchRegex }
+                ];
             }
 
             // Stream folders using a Mongoose cursor
             const foldersStream = Folder.find(foldersQuery).cursor();
 
             for await (const folder of foldersStream) {
-                const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
-                    await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+                if (search && await SearchService.hasLockedProtectedAncestor(userId, folder.parent_id, workspaceContext)) {
+                    continue;
+                }
 
-                const isLocked = folder.isPasswordProtected &&
-                    !folder.userAccess.some(access => access.userId === userId.toString());
-
-                yield {
-                    id: folder._id.toString(),
-                    name: folder.name,
-                    isFolder: true,
-                    hasChildren: childCount > 0,
-                    isLocked,
-                    isPasswordProtected: folder.isPasswordProtected,
-                    size: folder.size,  // Use the stored size from database
-                    createdAt: folder.createdAt,
-                    path: folder.path
-                };
+                yield await this.serializeFolder(folder, userId, {
+                    ancestors: await this.buildFolderAncestors(userId, folder._id, { workspaceContext })
+                });
             }
 
             // Stream files using another Mongoose cursor
             const filesStream = File.find(filesQuery).cursor();
 
             for await (const file of filesStream) {
-                const isLocked = file.isPasswordProtected &&
-                    !file.userAccess.some(access => access.userId === userId.toString());
+                if (search && await SearchService.hasLockedProtectedAncestor(userId, file.parent_id, workspaceContext)) {
+                    continue;
+                }
 
-                yield {
-                    id: file._id.toString(),
-                    name: file.name,
-                    isFolder: false,
-                    size: file.size,
-                    createdAt: file.createdAt,
-                    mimetype: file.mimetype,
-                    type: file.mimetype ? file.mimetype.split('/')[0] : 'unknown',
-                    path: file.path,
-                    isLocked,
-                    isPasswordProtected: file.isPasswordProtected
-                };
+                yield await this.serializeFile(file, userId, includeFileAncestors
+                    ? { ancestors: await this.buildFolderAncestors(userId, file.parent_id, { workspaceContext }) }
+                    : {});
             }
         } catch (error) {
             console.error('Error streaming files:', error);
@@ -221,7 +1219,176 @@ class FileService {
         }
     }
 
+    static async getDashboardSummary(userId, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
+        const filesQuery = {
+            ...scopedQuery,
+            deleted: false,
+            scanStatus: { $in: [null, 'clean'] }
+        };
+
+        const allFilesQuery = {
+            ...scopedQuery,
+            deleted: false
+        };
+
+        const foldersQuery = {
+            ...scopedQuery,
+            deleted: false
+        };
+
+        const [
+            fileCount,
+            folderCount,
+            protectedFileCount,
+            protectedFolderCount,
+            rootFileCount,
+            rootFolderCount,
+            storageResult,
+            mimeTypeResult,
+            scanStatusResult,
+            recentFiles,
+            recentFolders
+        ] = await Promise.all([
+            File.countDocuments(filesQuery),
+            Folder.countDocuments(foldersQuery),
+            File.countDocuments({ ...filesQuery, isPasswordProtected: true }),
+            Folder.countDocuments({ ...foldersQuery, isPasswordProtected: true }),
+            File.countDocuments({ ...filesQuery, parent_id: null }),
+            Folder.countDocuments({ ...foldersQuery, parent_id: null }),
+            File.aggregate([
+                { $match: filesQuery },
+                {
+                    $group: {
+                        _id: null,
+                        totalBytes: { $sum: { $ifNull: ['$size', 0] } }
+                    }
+                }
+            ]),
+            File.aggregate([
+                { $match: filesQuery },
+                {
+                    $group: {
+                        _id: '$mimetype',
+                        count: { $sum: 1 },
+                        bytes: { $sum: { $ifNull: ['$size', 0] } }
+                    }
+                }
+            ]),
+            File.aggregate([
+                { $match: allFilesQuery },
+                {
+                    $group: {
+                        _id: { $ifNull: ['$scanStatus', 'unscanned'] },
+                        count: { $sum: 1 }
+                    }
+                }
+            ]),
+            File.find(filesQuery)
+                .select('_id name path mimetype size createdAt updatedAt parent_id isPasswordProtected')
+                .sort({ createdAt: -1 })
+                .limit(8)
+                .lean(),
+            Folder.find(foldersQuery)
+                .select('_id name path size createdAt parent_id isPasswordProtected')
+                .sort({ createdAt: -1 })
+                .limit(8)
+                .lean()
+        ]);
+
+        const recentFileItems = await Promise.all(recentFiles.map(async (file) => ({
+            id: file._id.toString(),
+            name: file.name,
+            path: file.path,
+            mimetype: file.mimetype,
+            type: file.mimetype,
+            size: file.size || 0,
+            createdAt: file.createdAt,
+            isFolder: false,
+            isPasswordProtected: file.isPasswordProtected,
+            parent_id: file.parent_id,
+            ancestors: await this.buildFolderAncestors(userId, file.parent_id, { workspaceContext })
+        })));
+
+        const recentFolderItems = await Promise.all(recentFolders.map(async (folder) => ({
+            id: folder._id.toString(),
+            name: folder.name,
+            path: folder.path,
+            type: 'Folder',
+            size: folder.size || 0,
+            createdAt: folder.createdAt,
+            isFolder: true,
+            isPasswordProtected: folder.isPasswordProtected,
+            parent_id: folder.parent_id,
+            ancestors: await this.buildFolderAncestors(userId, folder._id, { workspaceContext })
+        })));
+
+        const recentItems = [...recentFileItems, ...recentFolderItems]
+            .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt))
+            .slice(0, 8);
+
+        const totalBytes = storageResult[0]?.totalBytes || 0;
+        const breakdownByCategory = new Map();
+
+        mimeTypeResult.forEach((entry) => {
+            const category = this.getFileCategory(entry._id);
+            const current = breakdownByCategory.get(category) || {
+                category,
+                count: 0,
+                bytes: 0,
+                iconCls: this.getFileCategoryIcon(category)
+            };
+
+            current.count += entry.count || 0;
+            current.bytes += entry.bytes || 0;
+            breakdownByCategory.set(category, current);
+        });
+
+        const typeBreakdown = Array.from(breakdownByCategory.values())
+            .sort((first, second) => second.bytes - first.bytes)
+            .map((entry) => ({
+                ...entry,
+                percent: totalBytes > 0 ? Math.round((entry.bytes / totalBytes) * 100) : 0
+            }));
+
+        const scanCounts = scanStatusResult.reduce((result, entry) => {
+            result[entry._id || 'unscanned'] = entry.count || 0;
+            return result;
+        }, {
+            pending: 0,
+            scanning: 0,
+            clean: 0,
+            infected: 0,
+            unscanned: 0
+        });
+
+        const scanTotal = Object.values(scanCounts).reduce((sum, value) => sum + (Number(value) || 0), 0);
+        scanCounts.ready = fileCount;
+        scanCounts.total = scanTotal;
+
+        return {
+            counts: {
+                files: fileCount,
+                folders: folderCount,
+                protectedItems: protectedFileCount + protectedFolderCount,
+                rootItems: rootFileCount + rootFolderCount
+            },
+            storage: {
+                totalBytes
+            },
+            scan: scanCounts,
+            typeBreakdown,
+            recentItems,
+            generatedAt: new Date()
+        };
+    }
+
     static async updateFolderSize(folderId) {
+        if (StorageService.isObjectStorage()) {
+            return this.recalculateFolderStats(folderId);
+        }
+
         const folder = await Folder.findById(folderId);
         if (!folder) return;
 
@@ -237,44 +1404,54 @@ class FileService {
         }
     }
 
-    static async recalculateFolderStats(folderId) {
+    static async recalculateFolderStats(folderId, options = {}) {
         if (!folderId || folderId === 'root') {
             return;
         }
 
         try {
-            // Find the folder
+            const visited = options.visited || new Set();
+            const normalizedFolderId = folderId.toString();
+
+            if (visited.has(normalizedFolderId)) {
+                return { totalSize: 0, fileCount: 0, folderCount: 0 };
+            }
+            visited.add(normalizedFolderId);
+
             const folder = await Folder.findById(folderId);
             if (!folder) return;
 
-            // Get all immediate children (files and folders)
             const [files, subfolders] = await Promise.all([
-                File.find({ parent_id: folderId, deleted: false }),
-                Folder.find({ parent_id: folderId, deleted: false })
+                File.find({
+                    parent_id: normalizedFolderId,
+                    deleted: false,
+                    scanStatus: { $in: [null, 'clean'] }
+                }).select('size'),
+                Folder.find({ parent_id: normalizedFolderId, deleted: false })
             ]);
 
-            // Calculate stats
-            let totalSize = 0;
+            let totalSize = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
             const fileCount = files.length;
             const folderCount = subfolders.length;
 
-            // Sum up file sizes
-            totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
-
-            // Add subfolder sizes
             for (const subfolder of subfolders) {
-                totalSize += subfolder.size || 0;
+                const childStats = await this.recalculateFolderStats(subfolder._id, {
+                    visited,
+                    propagate: false
+                });
+                totalSize += Number(childStats && childStats.totalSize) || 0;
             }
 
-            // Update folder stats
             folder.size = totalSize;
             folder.fileCount = fileCount;
             folder.folderCount = folderCount;
             await folder.save();
 
-            // Update parent folder if exists
-            if (folder.parent_id) {
-                await this.recalculateFolderStats(folder.parent_id);
+            if (options.propagate !== false && folder.parent_id) {
+                await this.recalculateFolderStats(folder.parent_id, {
+                    visited: new Set(),
+                    propagate: true
+                });
             }
 
             return { totalSize, fileCount, folderCount };
@@ -284,28 +1461,37 @@ class FileService {
         }
     }
 
-    static async deleteFile(userId, fileId) {
-        const file = await File.findOne({ _id: fileId, userId: userId });
+    static async deleteFile(userId, fileId, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const file = await File.findOne({
+            _id: fileId,
+            ...this.getScopedItemQuery(workspaceContext)
+        });
         if (!file) {
             throw new Error('File not found');
         }
-        const filePath = path.join(this.uploadDirectory, file.path);
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-            console.log(`File physically deleted: ${filePath}`);
-        }
+        await StorageService.deleteFile(file);
         file.deleted = true; // Assuming you have a 'deleted' field
         await file.save();
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
 
         if (file.parent_id) {
-            this.recalculateFolderStats(file.parent_id);
+            await this.recalculateFolderStats(file.parent_id);
         }
     }
 
-    static async deleteMultipleFiles(userId, ids, parentId) {
+    static async deleteMultipleFiles(userId, ids, parentId, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
         // Find files and folders to be deleted
-        const files = await File.find({ _id: { $in: ids }, userId: userId, deleted: false });
-        const folders = await Folder.find({ _id: { $in: ids }, userId: userId, deleted: false });
+        const files = await File.find({ _id: { $in: ids }, ...scopedQuery, deleted: false });
+        const folders = await Folder.find({ _id: { $in: ids }, ...scopedQuery, deleted: false });
 
         const deletionResults = {
             filesDeleted: 0,
@@ -322,13 +1508,7 @@ class FileService {
                     continue;
                 }
 
-                const filePath = path.join(this.uploadDirectory, file.path);
-                
-                // Delete file from filesystem if it exists
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                    console.log(`File physically deleted: ${filePath}`);
-                }
+                await StorageService.deleteFile(file);
 
                 // Mark file as deleted in database
                 await File.updateOne({ _id: file._id }, { $set: { deleted: true } });
@@ -350,7 +1530,7 @@ class FileService {
                 }
 
                 // Recursively delete folder and its contents
-                await this.deleteFolderRecursively(folder._id, userId);
+                await this.deleteFolderRecursively(folder._id, userId, { workspaceContext });
                 console.log(`Folder and contents deleted: ${folder.path}`);
                 deletionResults.foldersDeleted++;
             } catch (error) {
@@ -368,33 +1548,39 @@ class FileService {
             }
         }
 
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
         return {
             success: deletionResults.errors.length === 0,
             ...deletionResults
         };
     }
 
-    static async deleteFolderRecursively(folderId, userId) {
+    static async deleteFolderRecursively(folderId, userId, options = {}) {
         try {
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+            const scopedQuery = this.getScopedItemQuery(workspaceContext);
             // Find the folder to delete
-            const folderToDelete = await Folder.findOne({ _id: folderId, userId });
+            const folderToDelete = await Folder.findOne({ _id: folderId, ...scopedQuery });
             if (!folderToDelete) {
                 throw new Error(`Folder with ID ${folderId} not found.`);
             }
 
-            const folderPath = path.join(this.uploadDirectory, folderToDelete.path);
-
             // Find all subfolders and files
             const subFolders = await Folder.find({
                 path: new RegExp(`^${folderToDelete.path}/`),
-                userId,
+                ...scopedQuery,
                 deleted: false
             });
             const subFiles = await File.find({
                 path: new RegExp(`^${folderToDelete.path}/`),
-                userId,
+                ...scopedQuery,
                 deleted: false
             });
+
+            for (const file of subFiles) {
+                await StorageService.deleteFile(file);
+            }
 
             // Mark all items as deleted in database
             await Folder.updateMany(
@@ -406,13 +1592,16 @@ class FileService {
                 { $set: { deleted: true } }
             );
 
-            // Delete the physical folder and all its contents
-            if (fs.existsSync(folderPath)) {
-                fs.rmSync(folderPath, { recursive: true, force: true });
-                console.log(`Folder physically deleted: ${folderPath}`);
+            if (!StorageService.isObjectStorage()) {
+                const folderPath = path.join(this.uploadDirectory, folderToDelete.path);
+                if (fs.existsSync(folderPath)) {
+                    fs.rmSync(folderPath, { recursive: true, force: true });
+                    console.log(`Folder physically deleted: ${folderPath}`);
+                }
             }
 
             console.log(`Folder ${folderToDelete.name} and its contents deleted completely.`);
+            StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
             return { success: true };
         } catch (error) {
             console.error('Error in deleteFolderRecursively:', error);
@@ -421,75 +1610,121 @@ class FileService {
     }
 
     static async viewFile(userId, fileId) {
-        const file = await this.getFileById(userId, fileId);
+        const file = await this.getAccessibleFileById(userId, fileId);
         
         if (!file) {
             throw new Error('File not found');
         }
 
-        // Check if file is password protected and not recently verified by this user
-        if (file.isPasswordProtected) {
-            const userAccess = file.userAccess.find(
-                access => access.userId === userId.toString()
-            );
-            
-            const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
-            const now = new Date();
-            
-            // Check if user hasn't accessed in the last 30 minutes
-            if (!lastAccessed || (now - lastAccessed) > 30 * 60 * 1000) {
-                throw new Error('Password verification required');
-            }
+        await this.assertSharedFileReadyForAccess(file, userId);
+        this.assertPasswordAccess(file, userId);
+
+        const exists = await StorageService.fileExists(file);
+
+        if (!exists) {
+            throw new Error('File not found in storage');
         }
 
-        const filePath = path.join(this.uploadDirectory, file.path);
-        if (!fs.existsSync(filePath)) {
-            throw new Error('File not found on disk');
-        }
-
-        const mimeType = mime.getType(filePath);
-        return { filePath, mimeType };
+        const mimeType = file.mimetype || mime.getType(file.name);
+        return { file, mimeType };
     }
 
     static async getFileById(userId, fileId) {
-        const file = await File.findOne({ 
-            _id: fileId, 
-            userId: userId,
-            deleted: false 
-        });
+        return this.getAccessibleFileById(userId, fileId);
+    }
+
+    static async updateFileContent(userId, fileId, content) {
+        if (typeof content !== 'string') {
+            throw new Error('Content must be a string');
+        }
+
+        const file = await this.getFileById(userId, fileId);
+        if (!file) {
+            throw new Error('File not found');
+        }
+
+        if (file.userId.toString() !== userId.toString()) {
+            const error = new Error('Only the owner can edit this file');
+            error.statusCode = 403;
+            throw error;
+        }
+
+        this.assertPasswordAccess(file, userId);
+
+        const exists = await StorageService.fileExists(file);
+        if (!exists) {
+            throw new Error('File not found in storage');
+        }
+
+        const mimeType = file.mimetype || mime.getType(file.name);
+        if (!['text/plain', 'application/json'].includes(mimeType)) {
+            throw new Error('Only text and JSON files can be edited');
+        }
+
+        const filePath = StorageService.isObjectStorage()
+            ? this.getTempPath('edits', userId, file._id.toString(), file.name)
+            : path.join(this.uploadDirectory, file.path);
+
+        await fs.ensureDir(path.dirname(filePath));
+        await fs.writeFile(filePath, content, 'utf8');
+
+        const stats = fs.statSync(filePath);
+        if (StorageService.isObjectStorage()) {
+            await StorageService.uploadFile(file, filePath, {
+                'Content-Type': mimeType || 'text/plain',
+                'Original-Name': file.name
+            });
+            await fs.remove(filePath);
+        }
+
+        file.size = stats.size;
+        await file.save();
+        StorageInsightsService.invalidateUser(userId);
+
+        if (file.parent_id) {
+            await this.recalculateFolderStats(file.parent_id);
+        }
+
         return file;
     }
 
-    static async createFolder(userId, folderName, parent_id = null) {
+    static async createFolder(userId, folderName, parent_id = null, options = {}) {
         if (!userId || !folderName) {
             throw new Error('userId and folderName are required');
         }
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const workspace = workspaceContext.workspace;
+        const workspacePatch = this.getWorkspaceItemPatch(workspaceContext, userId);
 
         if (folderName.indexOf('..') > -1) {
             throw new Error('Invalid target folder. Directory traversal is not allowed.');
         }
 
         // Determine the folder's relative path based on parent_id
-        let folderPath = userId; // Start the path with userId as the base directory
+        let folderPath = workspace.rootPath; // Start the path with workspace root as the base directory
 
         if (parent_id) {
             const parentFolder = await Folder.findById(parent_id);
-            if (!parentFolder || parentFolder.userId !== userId) {
+            if (!parentFolder || parentFolder.workspaceId !== workspace._id.toString()) {
                 throw new Error('Parent folder not found or access denied');
             }
             folderPath = path.join(parentFolder.path, folderName); // Path relative to parent folder
         } else {
-            folderPath = path.join(userId, folderName); // Top-level folder under user’s directory
+            folderPath = path.join(workspace.rootPath, folderName); // Top-level folder under workspace
         }
 
-        const fullPath = path.join(FileService.uploadDirectory, folderPath); // Full path for filesystem
-
-        // Create the directory in the filesystem
-        fs.mkdirSync(fullPath, { recursive: true });
+        if (!StorageService.isObjectStorage()) {
+            const fullPath = path.join(FileService.uploadDirectory, folderPath); // Full path for filesystem
+            fs.mkdirSync(fullPath, { recursive: true });
+        }
 
         // Save folder information in the database
         const newFolder = new Folder({
             userId,
+            ...workspacePatch,
             parent_id: parent_id,
             name: folderName,
             path: folderPath, // Save as relative path including userId
@@ -497,14 +1732,21 @@ class FileService {
         });
 
         await newFolder.save();
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
 
         return newFolder;
     }
 
-    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null, archiveType = 'zip', compressionLevel = 6) {
+    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null, archiveType = 'zip', compressionLevel = 6, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
         // Validate items exist and user has access
         const validatedItems = [];
         const affectedFolders = new Set(); // Track folders that need size recalculation
+        const compressionTempRoot = this.getTempPath('compression', userId, `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
 
         for (const itemId of items) {
             try {
@@ -515,18 +1757,22 @@ class FileService {
                 let itemParentId;
 
                 // Try to find the item as a file first
-                const file = await File.findById(itemId);
-                if (file && file.userId.toString() === userId) {
+                const file = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false });
+                if (file) {
                     itemType = 'file';
-                    itemPath = path.join(this.uploadDirectory, file.path);
+                    itemPath = StorageService.isObjectStorage()
+                        ? await StorageService.materializeFile(file, path.join(compressionTempRoot, 'files', file._id.toString(), file.name))
+                        : path.join(this.uploadDirectory, file.path);
                     itemName = file.name;
                     itemParentId = file.parent_id;
                 } else {
                     // If not found as file, try as a folder
-                    const folder = await Folder.findById(itemId);
-                    if (folder && folder.userId.toString() === userId) {
+                    const folder = await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
+                    if (folder) {
                         itemType = 'folder';
-                        itemPath = path.join(this.uploadDirectory, folder.path);
+                        itemPath = StorageService.isObjectStorage()
+                            ? await this.materializeFolder(folder, path.join(compressionTempRoot, 'folders', folder._id.toString(), folder.name))
+                            : path.join(this.uploadDirectory, folder.path);
                         itemName = folder.name;
                         itemParentId = folder.parent_id;
                     } else {
@@ -602,7 +1848,10 @@ class FileService {
 
         const timestamp = Date.now();
         const name = zipFileName || `compressed_${timestamp}${fileExtension}`;
-        const targetFolder = path.join(this.uploadDirectory, userId, folder);
+        const relativeUploadDir = await this.getRelativeUploadDir(userId, parentId, folder, { workspaceContext });
+        const targetFolder = StorageService.isObjectStorage()
+            ? path.join(compressionTempRoot, 'output')
+            : path.join(this.uploadDirectory, relativeUploadDir);
         const zipFilePath = path.join(targetFolder, name);
 
         if (!fs.existsSync(targetFolder)) {
@@ -614,18 +1863,11 @@ class FileService {
         try {
             const result = await CompressionService.compressFiles(filePaths, zipFilePath, archiveType, compressionLevel, progressCallback);
             
-            const compressedFile = new File({
-                name,
-                path: path.join(userId, folder, name),
-                size: result.archiveSize,
-                mimetype: mimeType,
-                createdAt: new Date(),
-                deleted: false,
-                userId: userId,
-                parent_id: parentId
-            });
-
+            const compressedFile = await this.saveFileMetadata(zipFilePath, userId, name, parentId, relativeUploadDir, { workspaceContext });
+            compressedFile.mimetype = mimeType;
+            compressedFile.size = result.archiveSize;
             await compressedFile.save();
+            StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
 
             // Recalculate sizes for all affected folders
             for (const folderId of affectedFolders) {
@@ -637,37 +1879,81 @@ class FileService {
                 await this.recalculateFolderStats(parentId);
             }
 
+            if (StorageService.isObjectStorage()) {
+                await fs.remove(compressionTempRoot);
+            }
+
             return { success: true, file: compressedFile };
         } catch (error) {
             console.error('Error in compression process:', error);
             if (fs.existsSync(zipFilePath)) {
                 fs.unlink(zipFilePath, () => {});
             }
+            if (StorageService.isObjectStorage()) {
+                await fs.remove(compressionTempRoot);
+            }
             this.ongoingCompressions.delete(key);
             throw error;
         }
     }
 
-    static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
-        const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+    static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const workspace = workspaceContext.workspace;
+        const workspacePatch = this.getWorkspaceItemPatch(workspaceContext, userId);
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
         const io = socket.getIO();
+        const progressId = options.progressId || null;
+        const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+        const archiveLogicalPath = zipFilePath;
+        const decompressionTempRoot = this.getTempPath('decompression', userId, `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
+        const rootDir = StorageService.isObjectStorage()
+            ? path.resolve(decompressionTempRoot)
+            : path.resolve(path.join(this.uploadDirectory, workspace.rootPath));
         let targetDir;
         let parentFolderId = parentId;
         let parentFolderPath = '';
 
         if (parentId) {
-            const parentFolder = await Folder.findById(parentId);
+            const parentFolder = await Folder.findOne({ _id: parentId, ...scopedQuery, deleted: false });
             if (!parentFolder) {
                 throw new Error('Parent folder not found');
             }
-            targetDir = path.join(this.uploadDirectory, parentFolder.path);
+            targetDir = StorageService.isObjectStorage()
+                ? path.join(decompressionTempRoot, 'output')
+                : path.join(this.uploadDirectory, parentFolder.path);
             parentFolderPath = parentFolder.path;
         } else {
-            targetDir = rootDir;
-            parentFolderPath = userId;
+            targetDir = StorageService.isObjectStorage()
+                ? path.join(decompressionTempRoot, 'output')
+                : rootDir;
+            parentFolderPath = workspace.rootPath;
         }
 
-        zipFilePath = path.join(this.uploadDirectory, zipFilePath);
+        if (StorageService.isObjectStorage()) {
+            const archiveFile = await File.findOne({ ...scopedQuery, path: archiveLogicalPath, deleted: false });
+            if (!archiveFile) {
+                throw new Error('Archive file not found');
+            }
+
+            this.assertPasswordAccess(archiveFile, userId);
+            zipFilePath = await StorageService.materializeFile(
+                archiveFile,
+                path.join(decompressionTempRoot, 'archive', archiveFile.name)
+            );
+        } else {
+            const archiveFile = await File.findOne({ ...scopedQuery, path: archiveLogicalPath, deleted: false });
+            if (!archiveFile) {
+                throw new Error('Archive file not found');
+            }
+            this.assertPasswordAccess(archiveFile, userId);
+            zipFilePath = path.join(this.uploadDirectory, zipFilePath);
+        }
+
+        await fs.ensureDir(targetDir);
 
         if (!targetDir.startsWith(rootDir)) {
             throw new Error('Invalid target folder. Directory traversal is not allowed.');
@@ -696,11 +1982,17 @@ class FileService {
             processedEntries++;
             if (processedEntries % Math.max(1, Math.floor(totalEntries * 0.01)) === 0) {
                 const progress = Math.round((processedEntries / totalEntries) * 100);
-                io.emit('decompressionProgress', {
+                const progressPayload = {
                     userId,
+                    progressId,
                     progress,
                     fileName: path.basename(zipFilePath)
-                });
+                };
+
+                io.to(userId.toString()).emit('decompressionProgress', progressPayload);
+                if (onProgress) {
+                    onProgress(progressPayload);
+                }
             }
         }
         
@@ -781,7 +2073,8 @@ class FileService {
                 name: folder.name,
                 path: path.join(parentFolderPath, folder.fullPath),
                 parent_id: parentId,
-                userId
+                userId,
+                ...workspacePatch
             });
 
             await newFolder.save();
@@ -803,21 +2096,41 @@ class FileService {
             const absoluteFilePath = path.join(targetDir, file.path);
 
             // Only create file if it doesn't exist
-            const existingFile = await File.findOne({ path: fullPath, userId, deleted: false });
+            const existingFile = await File.findOne({ path: fullPath, ...scopedQuery, deleted: false });
             if (!existingFile) {
                 const stats = fs.statSync(absoluteFilePath);
                 const mimeType = mime.getType(file.path) || 'application/octet-stream';
 
                 console.log(`Creating file`, file.name);
 
-                return {
-                    name: file.name,
-                    path: fullPath,
-                    parent_id: parentId,
-                    size: stats.size,
-                    mimetype: mimeType,
-                    userId,
-                };
+                if (StorageService.isObjectStorage()) {
+                    const savedFile = await this.saveFileMetadata(
+                        absoluteFilePath,
+                        userId,
+                        file.name,
+                        parentId,
+                        path.dirname(fullPath),
+                        { workspaceContext }
+                    );
+                    savedFile.mimetype = mimeType;
+                    savedFile.size = stats.size;
+                    await savedFile.save();
+                    return savedFile;
+                }
+
+                    return {
+                        name: file.name,
+                        path: fullPath,
+                        parent_id: parentId,
+                        size: stats.size,
+                        mimetype: mimeType,
+                        userId,
+                        ...workspacePatch,
+                        scanStatus: 'clean',
+                        storageProvider: StorageService.providerName,
+                        bucket: StorageService.bucket,
+                        storageKey: fullPath
+                    };
             }
             return null;
         });
@@ -827,9 +2140,10 @@ class FileService {
         for (let i = 0; i < filePromises.length; i += batchSize) {
             const batch = filePromises.slice(i, i + batchSize);
             const files = (await Promise.all(batch)).filter(file => file !== null);
-            if (files.length > 0) {
+            if (files.length > 0 && !StorageService.isObjectStorage()) {
                 console.log(files);
                 await File.insertMany(files);
+                StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
             }
         }
 
@@ -847,52 +2161,69 @@ class FileService {
         });
 
         for (const folderId of sortedForSizes) {
-            this.recalculateFolderStats(folderId);
+            await this.recalculateFolderStats(folderId);
+        }
+
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
+        if (StorageService.isObjectStorage()) {
+            await fs.remove(decompressionTempRoot);
+            return parentFolderPath;
         }
 
         return path.relative(this.uploadDirectory, targetDir);
     }
 
-    static async saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream)
-    {
+    static async saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        const workspacePatch = this.getWorkspaceItemPatch(workspaceContext, userId);
+
         if (!parentId) {
             parentId = null;
         }
 
         if (!relativeUploadDir) {
-            relativeUploadDir = userId;
+            relativeUploadDir = workspaceContext.workspace.rootPath;
         }
 
-        return new Promise((resolve, reject) => {
-            writeStream.on('finish', async () => {
-                await fs.stat(targetPath, async (err, stats) => {
-                    if (err) {
-                        console.error('Error fetching file stats:', err);
-                        reject(err);
-                    } else {
-                        // Save metadata to the database
-                        // const stats = fs.statSync(targetPath);
-                        const mimeType = mime.getType(targetPath);
+        const hasExplicitScanStatus = Object.prototype.hasOwnProperty.call(options, 'scanStatus');
+        const scanStatus = hasExplicitScanStatus
+            ? options.scanStatus
+            : (options.requiresVirusScan && config.virusScanning?.enabled ? 'pending' : 'clean');
 
-                        const file = new File({
-                            userId,
-                            name: filename,
-                            parent_id: parentId,
-                            path: path.join(relativeUploadDir, filename),
-                            size: stats.size,
-                            mimetype: mimeType,
-                            createdAt: new Date(),
-                            deleted: false,
-                            scanStatus: config.virusScanning?.enabled ? 'pending' : 'clean' // Set as clean if scanning disabled
-                        });
-
-                        await file.save();
-
-                        resolve(file);
-                    }
-                });
-            });
+        const stats = await fs.stat(targetPath);
+        const mimeType = mime.getType(targetPath);
+        const file = new File({
+            userId,
+            ...workspacePatch,
+            name: filename,
+            parent_id: parentId,
+            path: this.getLogicalFilePath(workspaceContext.workspace.rootPath, relativeUploadDir, filename),
+            size: stats.size,
+            mimetype: mimeType,
+            createdAt: new Date(),
+            deleted: false,
+            scanStatus,
+            storageProvider: StorageService.providerName,
+            bucket: StorageService.bucket
         });
+
+        file.storageKey = StorageService.isObjectStorage()
+            ? StorageService.buildFileKey(workspaceContext.workspace._id.toString(), file._id.toString())
+            : file.path;
+
+        if (StorageService.isObjectStorage()) {
+            await StorageService.uploadFile(file, targetPath, {
+                'Content-Type': mimeType || 'application/octet-stream',
+                'Original-Name': filename
+            });
+            await fs.remove(targetPath);
+        }
+
+        await file.save();
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
+        return file;
     }
 
     static async stopCompression(userId, zipFileName) {
@@ -939,6 +2270,10 @@ class FileService {
     }
 
     static async updateFolderSize(folderId) {
+        if (StorageService.isObjectStorage()) {
+            return this.recalculateFolderStats(folderId);
+        }
+
         const folder = await Folder.findById(folderId);
         if (!folder) return;
 
@@ -954,31 +2289,41 @@ class FileService {
         }
     }
 
-    static async renameItem(userId, itemId, newName, isFolder) {
+    static async renameItem(userId, itemId, newName, isFolder, options = {}) {
         if (!userId || !itemId || !newName) {
             throw new Error('userId, itemId, and newName are required');
         }
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
 
         if (newName.indexOf('..') > -1) {
             throw new Error('Invalid target folder. Directory traversal is not allowed.');
+        }
+
+        if (newName !== path.basename(newName)) {
+            throw new Error('Invalid name. Nested paths are not allowed.');
         }
 
         let item, oldPath, newPath;
 
         if (isFolder) {
             // Find the folder by ID
-            item = await Folder.findOnBy({ _id: itemId, userId });
+            item = await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
             if (!item) throw new Error('Folder not found or access denied');
 
             // Set old and new paths for renaming
             oldPath = item.path;
             newPath = path.join(path.dirname(oldPath), newName);
 
-            // Rename the folder in the filesystem
-            await fs.renameSync(
-                path.join(this.uploadDirectory, oldPath),
-                path.join(this.uploadDirectory, newPath)
-            );
+            if (!StorageService.isObjectStorage()) {
+                fs.renameSync(
+                    path.join(this.uploadDirectory, oldPath),
+                    path.join(this.uploadDirectory, newPath)
+                );
+            }
 
             // Update the folder's own path in the database
             item.name = newName;
@@ -988,18 +2333,30 @@ class FileService {
             // Update all child folders and files with paths that start with the old path
             const oldPathSegment = oldPath;
             const newPathSegment = newPath;
+            const childPathRegex = new RegExp(`^${this.escapeRegExp(oldPathSegment)}/`);
 
             // Find and update child folders
-            const childFolders = await Folder.find({path: new RegExp(`^${oldPathSegment}/`)});
+            const childFolders = await Folder.find({
+                ...scopedQuery,
+                deleted: false,
+                path: childPathRegex
+            });
             const updateFolderPromises = childFolders.map(folder => {
                 folder.path = folder.path.replace(oldPathSegment, newPathSegment);
                 return folder.save();
             });
 
             // Find and update child files
-            const childFiles = await File.find({path: new RegExp(`^${oldPathSegment}/`)});
+            const childFiles = await File.find({
+                ...scopedQuery,
+                deleted: false,
+                path: childPathRegex
+            });
             const updateFilePromises = childFiles.map(file => {
                 file.path = file.path.replace(oldPathSegment, newPathSegment);
+                if (!StorageService.isObjectStorage()) {
+                    file.storageKey = file.path;
+                }
                 return file.save();
             });
 
@@ -1008,18 +2365,20 @@ class FileService {
 
         } else {
             // Find the file by ID
-            item = await File.findBy({ _id: itemId, userId });
-            if (!item || item.userId !== userId) throw new Error('File not found or access denied');
+            item = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false });
+            if (!item) throw new Error('File not found or access denied');
 
             // Set old and new paths for renaming
             oldPath = item.path;
             newPath = path.join(path.dirname(oldPath), newName);
 
-            // Rename the file in the filesystem
-            fs.renameSync(
-                path.join(this.uploadDirectory, oldPath),
-                path.join(this.uploadDirectory, newPath)
-            );
+            if (!StorageService.isObjectStorage()) {
+                fs.renameSync(
+                    path.join(this.uploadDirectory, oldPath),
+                    path.join(this.uploadDirectory, newPath)
+                );
+                item.storageKey = newPath;
+            }
 
             // Update the file's name and path in the database
             item.name = newName;
@@ -1027,17 +2386,28 @@ class FileService {
             await item.save();
         }
 
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
         return `${isFolder ? 'Folder' : 'File'} renamed successfully`;
     }
 
-    static async moveItems(userId, itemIds, targetFolderId, progressCallback) {
+    static async moveItems(userId, itemIds, targetFolderId, progressCallback, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const workspace = workspaceContext.workspace;
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
         let targetFolder;
 
         // Validate the target folder
         if (!targetFolderId || targetFolderId === 'root') {
-            targetFolder = {path: userId};
+            targetFolder = {path: workspace.rootPath};
         } else {
-            targetFolder = await Folder.findById(targetFolderId);
+            targetFolder = await Folder.findOne({ _id: targetFolderId, ...scopedQuery, deleted: false });
+            if (!targetFolder) {
+                throw new Error('Target folder not found or access denied');
+            }
         }
 
         const totalItems = itemIds.length;
@@ -1045,7 +2415,8 @@ class FileService {
 
         for (const itemId of itemIds) {
             // Find the item to move (file or folder)
-            let item = await File.findById(itemId) || await Folder.findById(itemId);
+            let item = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false }) ||
+                await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
             if (!item) {
                 console.warn(`Item with ID ${itemId} not found. Skipping.`);
                 continue;
@@ -1055,12 +2426,14 @@ class FileService {
             const oldPath = item.path;
             const newPath = path.join(targetFolder.path, item.name);
 
-            // Move the item on the filesystem
-            await fs.move(
-                path.join(this.uploadDirectory, oldPath),
-                path.join(this.uploadDirectory, newPath),
-                {overwrite: false}
-            );
+            if (!StorageService.isObjectStorage()) {
+                await fs.move(
+                    path.join(this.uploadDirectory, oldPath),
+                    path.join(this.uploadDirectory, newPath),
+                    {overwrite: false}
+                );
+                item.storageKey = newPath;
+            }
 
             // Update item's `parent_id` and `path` in the database
             item.parent_id = targetFolderId === 'root' ? null : targetFolderId;
@@ -1073,19 +2446,24 @@ class FileService {
                 const newPathSegment = newPath;
 
                 // Update paths of child folders
-                const childFolders = await Folder.find({path: new RegExp(`^${oldPathSegment}/`)});
+                const childFolders = await Folder.find({...scopedQuery, path: new RegExp(`^${oldPathSegment}/`)});
                 for (const childFolder of childFolders) {
                     childFolder.path = childFolder.path.replace(oldPathSegment, newPathSegment);
                     await childFolder.save();
                 }
 
                 // Update paths of child files
-                const childFiles = await File.find({path: new RegExp(`^${oldPathSegment}/`)});
+                const childFiles = await File.find({...scopedQuery, path: new RegExp(`^${oldPathSegment}/`)});
                 for (const childFile of childFiles) {
                     childFile.path = childFile.path.replace(oldPathSegment, newPathSegment);
+                    if (!StorageService.isObjectStorage()) {
+                        childFile.storageKey = childFile.path;
+                    }
                     await childFile.save();
                 }
             }
+
+            processedItems++;
 
             if (progressCallback && typeof progressCallback === 'function') {
                 const progress = Math.round((processedItems / totalItems) * 100);
@@ -1097,18 +2475,28 @@ class FileService {
 
         // Recalculate stats for the target folder
         await this.recalculateFolderStats(targetFolderId);
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
 
         return {message: 'Items moved successfully'};
     }
 
-    static async moveItemsIntoZip(userId, itemIds, zipFileId) {
+    static async moveItemsIntoZip(userId, itemIds, zipFileId, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        const scopedQuery = this.getScopedItemQuery(workspaceContext);
+        const zipTempRoot = this.getTempPath('zip-move', userId, `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
+
         try {
-            const zipFile = await File.findOne({ _id: zipFileId, userId, deleted: false });
+            const zipFile = await File.findOne({ _id: zipFileId, ...scopedQuery, deleted: false });
             if (!zipFile || zipFile.mimetype !== 'application/zip') {
                 throw new Error('Target file is not a valid ZIP file.');
             }
 
-            const zipFilePath = path.join(this.uploadDirectory, zipFile.path);
+            const zipFilePath = StorageService.isObjectStorage()
+                ? await StorageService.materializeFile(zipFile, path.join(zipTempRoot, 'archive', zipFile.name))
+                : path.join(this.uploadDirectory, zipFile.path);
             const tmpZipFilePath = `${zipFilePath}.tmp`;
 
             const output = fs.createWriteStream(tmpZipFilePath);
@@ -1128,15 +2516,19 @@ class FileService {
             }
 
             for (const itemId of itemIds) {
-                const item = await File.findOne({ _id: itemId, userId, deleted: false })
-                    || await Folder.findOne({ _id: itemId, userId, deleted: false });
+                const item = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false })
+                    || await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
 
                 if (!item) {
                     console.warn(`Item with ID ${itemId} not found. Skipping.`);
                     continue;
                 }
 
-                const itemPath = path.join(this.uploadDirectory, item.path);
+                const itemPath = StorageService.isObjectStorage()
+                    ? item instanceof Folder
+                        ? await this.materializeFolder(item, path.join(zipTempRoot, 'items', item._id.toString(), item.name))
+                        : await StorageService.materializeFile(item, path.join(zipTempRoot, 'items', item._id.toString(), item.name))
+                    : path.join(this.uploadDirectory, item.path);
 
                 if (!fs.existsSync(itemPath)) {
                     console.warn(`Item path ${itemPath} does not exist. Skipping.`);
@@ -1146,7 +2538,7 @@ class FileService {
                 if (fs.statSync(itemPath).isDirectory()) {
                     console.log(`Adding folder to ZIP: ${item.name}`);
                     await this.addFolderToArchive(archive, itemPath, item.name);
-                    await this.deleteFolderAndContents(itemId);
+                    await this.deleteFolderAndContents(itemId, workspaceContext);
                 } else {
                     console.log(`Streaming file to ZIP: ${item.name}`);
                     try {
@@ -1154,8 +2546,8 @@ class FileService {
                         archive.append(fileStream, { name: item.name });
                         console.log(`File successfully queued: ${item.name}`);
 
-                        // Delete the file after it has been added to the archive
-                        fs.unlinkSync(itemPath);
+                        await StorageService.deleteFile(item);
+                        await File.updateOne({ _id: item._id }, { $set: { deleted: true } });
                     } catch (err) {
                         console.error(`Error adding file to ZIP: ${err.message}`);
                     }
@@ -1168,8 +2560,24 @@ class FileService {
             console.log('Replacing original ZIP file...');
             fs.renameSync(tmpZipFilePath, zipFilePath);
 
+            if (StorageService.isObjectStorage()) {
+                await StorageService.uploadFile(zipFile, zipFilePath, {
+                    'Content-Type': zipFile.mimetype || 'application/zip',
+                    'Original-Name': zipFile.name
+                });
+                const stats = fs.statSync(zipFilePath);
+                zipFile.size = stats.size;
+                await zipFile.save();
+                await fs.remove(zipTempRoot);
+            }
+
+            StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
             return { message: 'Items moved into ZIP file successfully' };
         } catch (error) {
+            if (StorageService.isObjectStorage()) {
+                await fs.remove(zipTempRoot);
+            }
             console.error('Error moving items into ZIP file:', error.message);
             throw new Error('Failed to move items into ZIP file');
         }
@@ -1229,82 +2637,170 @@ class FileService {
     }
 
     // Helper Method: Delete Folder and Its Contents
-    static async deleteFolderAndContents(folderId) {
-        const folder = await Folder.findOne({ _id: folderId, deleted: false });
+    static async deleteFolderAndContents(folderId, workspaceContext = null) {
+        const scope = workspaceContext && workspaceContext.workspace
+            ? { workspaceId: workspaceContext.workspace._id.toString() }
+            : {};
+        const folder = await Folder.findOne({ _id: folderId, ...scope, deleted: false });
         if (!folder) return;
 
-        const folderPath = path.join(this.uploadDirectory, folder.path);
-
         // Get all files and subfolders inside the folder
-        const files = await File.find({ parent_id: folderId, deleted: false });
-        const subfolders = await Folder.find({ parent_id: folderId, deleted: false });
+        const files = await File.find({ parent_id: folderId, ...scope, deleted: false });
+        const subfolders = await Folder.find({ parent_id: folderId, ...scope, deleted: false });
 
         // Delete all files in the folder
         for (const file of files) {
-            const filePath = path.join(this.uploadDirectory, file.path);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-            }
+            await StorageService.deleteFile(file);
             await File.deleteOne({ _id: file._id });
         }
 
         // Recursively delete all subfolders
         for (const subfolder of subfolders) {
-            await this.deleteFolderAndContents(subfolder._id);
+            await this.deleteFolderAndContents(subfolder._id, workspaceContext);
         }
 
-        // Delete the folder itself from disk and database
-        if (fs.existsSync(folderPath)) {
-            fs.rmSync(folderPath, { recursive: true, force: true });
+        if (!StorageService.isObjectStorage()) {
+            const folderPath = path.join(this.uploadDirectory, folder.path);
+            if (fs.existsSync(folderPath)) {
+                fs.rmSync(folderPath, { recursive: true, force: true });
+            }
         }
         await Folder.deleteOne({ _id: folderId });
     }
 
-    static async getFileStream(filePath) {
+    static async getFileStream(fileOrPath, options = {}) {
         try {
-            // Check if file exists
-            await fs.access(filePath);
-            
-            // Create read stream
-            const stream = fs.createReadStream(filePath);
-            
+            if (typeof fileOrPath === 'string') {
+                await fs.access(fileOrPath);
+
+                return {
+                    stream: fs.createReadStream(fileOrPath, options),
+                    mimetype: mime.getType(fileOrPath)
+                };
+            }
+
+            const stream = await StorageService.createReadStream(fileOrPath, options);
             return {
                 stream,
-                mimetype: mime.getType(filePath)
+                mimetype: fileOrPath.mimetype || mime.getType(fileOrPath.name)
             };
         } catch (error) {
             throw new Error('File not found or inaccessible');
         }
     }
 
-    static prepareDownload(filePath) {
-        const absolutePath = path.join(this.uploadDirectory, filePath);
-        if (!fs.existsSync(absolutePath)) {
+    static async getDownloadFile(userId, fileRef = {}) {
+        const reference = typeof fileRef === 'string' ? { filePath: fileRef } : fileRef || {};
+        const fileId = reference.fileId || reference.id || null;
+        const filePath = reference.filePath || reference.path || null;
+
+        const file = fileId
+            ? await this.getAccessibleFileById(userId, fileId)
+            : await File.findOne({
+                path: filePath,
+                deleted: false
+            });
+
+        if (!file || !await this.canAccessFile(userId, file)) {
             throw new Error('File does not exist.');
         }
-        return absolutePath;
+
+        if (!await this.canDownloadFile(userId, file)) {
+            throw new Error('Download access denied');
+        }
+
+        await this.assertSharedFileReadyForAccess(file, userId);
+        this.assertPasswordAccess(file, userId);
+
+        return file;
     }
 
-    static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
+    static async prepareDownload(userId, fileRef, offset = 0, chunkSize = 1024 * 1024, options = {}) {
+        const file = await this.getDownloadFile(userId, fileRef);
+        const fileSize = file.size || await this.getStoredFileSize(file);
+        const start = Math.max(0, offset);
+        const end = Math.min(start + chunkSize - 1, fileSize - 1);
+
+        if (options.trackDownload === true && start === 0) {
+            await this.recordDownloadAccess(userId, file);
+        }
+
+        return {
+            file,
+            fileSize,
+            start,
+            end,
+            contentLength: end >= start ? end - start + 1 : 0,
+            stream: end >= start ? (await this.getFileStream(file, { start, end })).stream : null
+        };
+    }
+
+    static async getStoredFileSizeByPath(userId, fileRef) {
+        const file = await this.getDownloadFile(userId, fileRef);
+        return file.size || await this.getStoredFileSize(file);
+    }
+
+    static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks, fileSize = null, options = {}) {
         try {
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+                ...options,
+                requireWrite: true
+            });
+            const normalizedFolderId = this.normalizeFolderId(folderId);
+            const normalizedCurrentChunk = parseInt(currentChunk, 10);
+            const normalizedTotalChunks = parseInt(totalChunks, 10);
+            const normalizedFileSize = fileSize != null ? parseInt(fileSize, 10) : null;
+            const progressFilter = this.getUploadProgressFilter(userId, filename, normalizedFolderId, workspaceContext);
+
+            let uploadProgress = await UploadProgress.findOne(progressFilter);
+
+            if (!uploadProgress && normalizedCurrentChunk === 1) {
+                await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+            }
+
+            if (uploadProgress) {
+                const hasMetadataMismatch =
+                    (Number.isInteger(normalizedTotalChunks) && uploadProgress.totalChunks && uploadProgress.totalChunks !== normalizedTotalChunks) ||
+                    (Number.isInteger(normalizedFileSize) && uploadProgress.fileSize && uploadProgress.fileSize !== normalizedFileSize);
+
+                if (hasMetadataMismatch) {
+                    await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+                    uploadProgress = null;
+                }
+            }
+
             // Process the uploaded chunk (store to disk or database)
-            const file = await this.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
+            const file = await this.uploadFile(
+                userId,
+                filename,
+                normalizedFolderId,
+                chunk,
+                normalizedCurrentChunk,
+                normalizedTotalChunks,
+                { workspaceContext }
+            );
 
             // Track uploaded chunk progress
-            const chunkIndex = parseInt(currentChunk, 10);
-
-            let uploadProgress = await UploadProgress.findOne({ filename, userId });
+            const chunkIndex = normalizedCurrentChunk;
 
             if (!uploadProgress) {
-                uploadProgress = new UploadProgress({ userId, filename, uploadedChunks: [] });
+                uploadProgress = new UploadProgress({
+                    ...progressFilter,
+                    workspaceType: workspaceContext.workspace.type,
+                    organizationId: workspaceContext.workspace.organizationId || null,
+                    fileSize: Number.isInteger(normalizedFileSize) ? normalizedFileSize : null,
+                    totalChunks: Number.isInteger(normalizedTotalChunks) ? normalizedTotalChunks : null,
+                    uploadedChunks: []
+                });
             }
 
             if (!uploadProgress.uploadedChunks.includes(chunkIndex)) {
                 uploadProgress.uploadedChunks.push(chunkIndex);
+                uploadProgress.uploadedChunks.sort((a, b) => a - b);
                 await uploadProgress.save();
             }
 
-            if (parseInt(currentChunk) >= parseInt(totalChunks) - 1) {
+            if (normalizedCurrentChunk >= normalizedTotalChunks) {
                 await uploadProgress.deleteOne();
             }
 
@@ -1312,63 +2808,129 @@ class FileService {
         } catch (error) {
             if (error.message.includes('Virus detected')) {
                 // Clean up any partially uploaded chunks
-                await this.cleanupPartialUpload(userId, filename);
+                await this.cleanupPartialUpload(userId, filename, folderId, options);
                 throw new Error('File rejected: Virus detected');
             }
             throw error;
         }
     }
 
-    static async cleanupPartialUpload(userId, filename) {
+    static async cleanupPartialUpload(userId, filename, folderId = null, options = {}) {
         try {
-            // Add cleanup logic here for partial uploads
-            // This might include removing temporary files and database records
-            const uploadProgress = await UploadProgress.findOne({ userId, filename });
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+            const normalizedFolderId = this.normalizeFolderId(folderId);
+            const progressFilter = this.getUploadProgressFilter(userId, filename, normalizedFolderId, workspaceContext);
+            const uploadProgress = await UploadProgress.findOne(progressFilter);
             if (uploadProgress) {
-                await uploadProgress.remove();
+                await uploadProgress.deleteOne();
             }
-            // Add any additional cleanup needed
+
+            try {
+                const { uploadDir } = await this.resolveUploadTarget(userId, normalizedFolderId, { workspaceContext });
+                const chunkDir = this.getChunkDir(uploadDir, filename);
+                if (fs.existsSync(chunkDir)) {
+                    await fs.remove(chunkDir);
+                }
+            } catch (resolveError) {
+                // Folder may have been deleted; the database cleanup above is still useful.
+            }
         } catch (error) {
             console.error('Error cleaning up partial upload:', error);
         }
     }
 
-    static async getUploadedChunks(filename, userId) {
+    static async getUploadedChunks(filename, userId, folderId = null, totalChunks = null, fileSize = null, options = {}) {
         try {
-            // Fetch upload progress from the database or storage system
-            const uploadProgress = await UploadProgress.findOne({ filename, userId });
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+            const normalizedFolderId = this.normalizeFolderId(folderId);
+            const progressFilter = this.getUploadProgressFilter(userId, filename, normalizedFolderId, workspaceContext);
+            const uploadProgress = await UploadProgress.findOne(progressFilter);
 
             if (!uploadProgress) {
                 return null; // No progress found for the file
             }
 
-            return uploadProgress.uploadedChunks; // Return the list of uploaded chunks
+            const normalizedTotalChunks = totalChunks != null ? parseInt(totalChunks, 10) : null;
+            const normalizedFileSize = fileSize != null ? parseInt(fileSize, 10) : null;
+            const hasMetadataMismatch =
+                (Number.isInteger(normalizedTotalChunks) && uploadProgress.totalChunks && uploadProgress.totalChunks !== normalizedTotalChunks) ||
+                (Number.isInteger(normalizedFileSize) && uploadProgress.fileSize && uploadProgress.fileSize !== normalizedFileSize);
+
+            if (hasMetadataMismatch) {
+                await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+                return null;
+            }
+
+            let uploadDir;
+            try {
+                ({ uploadDir } = await this.resolveUploadTarget(userId, normalizedFolderId, { workspaceContext }));
+            } catch (resolveError) {
+                await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+                return null;
+            }
+            const chunkDir = this.getChunkDir(uploadDir, filename);
+            const chunkNumbers = this.getChunkNumbers(chunkDir);
+
+            if (chunkNumbers.length === 0) {
+                await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+                return null;
+            }
+
+            const recordedChunks = new Set(uploadProgress.uploadedChunks || []);
+            const actualChunks = new Set(chunkNumbers);
+            const contiguousChunks = [];
+            const maxExpectedChunk = Number.isInteger(normalizedTotalChunks)
+                ? normalizedTotalChunks
+                : Math.max(...chunkNumbers);
+
+            for (let chunkIndex = 1; chunkIndex <= maxExpectedChunk; chunkIndex += 1) {
+                if (recordedChunks.has(chunkIndex) && actualChunks.has(chunkIndex)) {
+                    contiguousChunks.push(chunkIndex);
+                    continue;
+                }
+
+                break;
+            }
+
+            if (contiguousChunks.length === 0) {
+                await this.cleanupPartialUpload(userId, filename, normalizedFolderId, { workspaceContext });
+                return null;
+            }
+
+            if (contiguousChunks.length !== uploadProgress.uploadedChunks.length) {
+                uploadProgress.uploadedChunks = contiguousChunks;
+                await uploadProgress.save();
+            }
+
+            return contiguousChunks; // Return the list of uploaded chunks
         } catch (error) {
             console.error('Error retrieving uploaded chunks:', error.message);
             throw new Error('Failed to retrieve upload progress.');
         }
     }
 
-    static async getFolderTree(userId, parentId = null, isRoot = true) {
+    static async getFolderTree(userId, parentId = null, isRoot = true, options = {}) {
         try {
+            const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+            const scopedQuery = this.getScopedItemQuery(workspaceContext);
             if (parentId === 'root') {
                 parentId = null;
                 isRoot = true;
             }
 
             // Fetch folders for the current parent
-            const folders = await Folder.find({ userId, parent_id: parentId, deleted: false }).lean();
+            const folders = await Folder.find({ ...scopedQuery, parent_id: parentId, deleted: false }).lean();
 
             // Construct the tree for each folder
             const tree = await Promise.all(folders.map(async (folder) => {
                 // Only check for subfolders in tree mode
                 const subfolderCount = await Folder.countDocuments({ 
-                    userId, 
+                    ...scopedQuery,
                     parent_id: folder._id.toString(), 
                     deleted: false 
                 });
 
-                const children = await this.getFolderTree(userId, folder._id, false); // Recursive call to get child folders
+                const children = await this.getFolderTree(userId, folder._id, false, { workspaceContext }); // Recursive call to get child folders
                 return {
                     id: folder._id,
                     text: folder.name,
@@ -1384,6 +2946,216 @@ class FileService {
             console.error('Error in getFolderTree:', error.message);
             throw new Error('Failed to construct folder tree');
         }
+    }
+
+    static async shareItem(userId, itemId, isFolder, recipient, permission = 'download', expiryOptions = {}) {
+        if (!itemId || !recipient) {
+            throw new Error('Item and recipient are required');
+        }
+
+        const normalizedPermission = ['view', 'download'].includes(permission) ? permission : 'download';
+        const expiresAt = this.getExpiryDate(expiryOptions);
+        const Model = isFolder ? Folder : File;
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            workspaceId: expiryOptions.workspaceId || null
+        });
+        const item = await Model.findOne({
+            _id: itemId,
+            ...this.getScopedItemQuery(workspaceContext),
+            deleted: false
+        });
+
+        if (!item) {
+            throw new Error('Item not found or access denied');
+        }
+
+        const governedShare = workspaceContext.workspace.type === 'organization'
+            ? await OrganizationShareService.createShare(userId, workspaceContext.workspace.organizationId, {
+                itemId,
+                itemType: isFolder ? 'folder' : 'file',
+                targetType: 'member',
+                targetIdentifier: recipient,
+                permission: normalizedPermission,
+                expiresInHours: expiryOptions.expiresInHours,
+                expiresInMinutes: expiryOptions.expiresInMinutes
+            })
+            : null;
+
+        if (governedShare) {
+            return {
+                id: governedShare.id,
+                itemId: item._id.toString(),
+                itemType: isFolder ? 'folder' : 'file',
+                itemName: item.name,
+                permission: governedShare.permission,
+                permissions: governedShare.permissions,
+                expiresAt: governedShare.expiresAt,
+                targetType: governedShare.targetType,
+                recipient: {
+                    id: governedShare.recipientId,
+                    username: governedShare.targetLabel || recipient,
+                    email: governedShare.targetLabel || ''
+                }
+            };
+        }
+
+        const recipientUser = await User.findOne({
+            $or: [
+                { username: recipient },
+                { email: recipient }
+            ]
+        }).select('_id username email');
+
+        if (!recipientUser) {
+            throw new Error('Recipient user not found');
+        }
+
+        if (recipientUser._id.toString() === userId.toString()) {
+            throw new Error('You cannot share an item with yourself');
+        }
+
+        const share = await Share.findOneAndUpdate(
+            {
+                ownerId: userId.toString(),
+                workspaceId: item.workspaceId || null,
+                recipientId: recipientUser._id.toString(),
+                itemId: item._id.toString(),
+                itemType: isFolder ? 'folder' : 'file'
+            },
+            {
+                ownerId: userId.toString(),
+                workspaceId: item.workspaceId || null,
+                workspaceType: item.workspaceType || null,
+                organizationId: item.organizationId || null,
+                recipientId: recipientUser._id.toString(),
+                itemId: item._id.toString(),
+                itemType: isFolder ? 'folder' : 'file',
+                permission: normalizedPermission,
+                revoked: false,
+                expiresAt
+            },
+            {
+                upsert: true,
+                new: true,
+                setDefaultsOnInsert: true
+            }
+        );
+
+        await ActivityEventService.recordShareCreated({
+            actorUserId: userId,
+            ownerId: userId,
+            recipientId: recipientUser._id.toString(),
+            targetType: 'member',
+            targetLabel: recipientUser.username || recipientUser.email || recipient,
+            item,
+            itemType: isFolder ? 'folder' : 'file',
+            shareId: share._id.toString(),
+            permission: share.permission,
+            expiresAt: share.expiresAt
+        }).catch(error => {
+            console.error('Failed to record share activity:', error.message);
+        });
+
+        return {
+            id: share._id.toString(),
+            itemId: item._id.toString(),
+            itemType: isFolder ? 'folder' : 'file',
+            itemName: item.name,
+            permission: share.permission,
+            expiresAt: share.expiresAt,
+            recipient: {
+                id: recipientUser._id.toString(),
+                username: recipientUser.username,
+                email: recipientUser.email
+            }
+        };
+    }
+
+    static async revokeShare(userId, shareId) {
+        const share = await Share.findOne({
+            _id: shareId,
+            ownerId: userId.toString(),
+            revoked: false
+        });
+
+        if (!share) {
+            throw new Error('Share not found');
+        }
+
+        share.revoked = true;
+        await share.save();
+
+        const Model = share.itemType === 'folder' ? Folder : File;
+        const item = await Model.findOne({
+            _id: share.itemId,
+            userId: userId.toString()
+        }).lean();
+
+        if (item) {
+            await ActivityEventService.recordShareRevoked({
+                actorUserId: userId,
+                ownerId: userId,
+                recipientId: share.recipientId,
+                targetType: share.targetType || 'member',
+                targetLabel: share.targetLabel || 'recipient',
+                item,
+                itemType: share.itemType,
+                shareId: share._id.toString()
+            }).catch(error => {
+                console.error('Failed to record share revocation activity:', error.message);
+            });
+        }
+
+        return { success: true };
+    }
+
+    static async revokeItemShares(userId, itemId, isFolder, options = {}) {
+        const itemType = isFolder ? 'folder' : 'file';
+        const Model = isFolder ? Folder : File;
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        const item = await Model.findOne({
+            _id: itemId,
+            userId: userId.toString(),
+            ...this.getScopedItemQuery(workspaceContext),
+            deleted: false
+        });
+
+        if (!item) {
+            throw new Error('Item not found or access denied');
+        }
+
+        const shareFilter = this.getActiveOutgoingShareFilter(userId, {
+            itemId: item._id.toString(),
+            itemType,
+            workspaceId: item.workspaceId || null
+        });
+        const shares = await Share.find(shareFilter).lean();
+        const result = await Share.updateMany(
+            shareFilter,
+            {
+                $set: {
+                    revoked: true
+                }
+            }
+        );
+
+        await Promise.all(shares.map(share => ActivityEventService.recordShareRevoked({
+            actorUserId: userId,
+            ownerId: userId,
+            recipientId: share.targetType === 'member' || !share.targetType ? share.recipientId : null,
+            targetType: share.targetType || 'member',
+            targetLabel: share.targetLabel || 'recipient',
+            item,
+            itemType,
+            shareId: share._id.toString()
+        }).catch(error => {
+            console.error('Failed to record share revocation activity:', error.message);
+        })));
+
+        return {
+            success: true,
+            revokedCount: result.modifiedCount || result.nModified || 0
+        };
     }
 
     static async setPassword(userId, itemId, password, isFolder) {
@@ -1443,7 +3215,7 @@ class FileService {
         try {
             if (isFolder) {
                 const folder = await Folder.findOne({ _id: itemId, deleted: false }).select('+password');
-                if (!folder || !folder.isPasswordProtected) {
+                if (!folder || !folder.isPasswordProtected || !await this.canAccessFolder(userId, folder)) {
                     return false;
                 }
                 
@@ -1469,7 +3241,7 @@ class FileService {
                 await folder.save();
             } else {
                 const file = await File.findOne({ _id: itemId, deleted: false }).select('+password');
-                if (!file || !file.isPasswordProtected) {
+                if (!file || !file.isPasswordProtected || !await this.canAccessFile(userId, file)) {
                     return false;
                 }
                 

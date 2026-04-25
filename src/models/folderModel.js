@@ -4,6 +4,15 @@ const folderSchema = new mongoose.Schema({
     name: { type: String, required: true },
     path: { type: String, required: true },
     userId: { type: String, ref: 'User', required: true },
+    workspaceId: { type: String, default: null, index: true },
+    workspaceType: {
+        type: String,
+        enum: ['personal', 'organization', null],
+        default: null,
+        index: true
+    },
+    organizationId: { type: String, default: null, index: true },
+    createdByUserId: { type: String, default: null, index: true },
     parent_id: { type: String, default: null },
     deleted: { type: Boolean, default: false },
     isPasswordProtected: { type: Boolean, default: false },
@@ -29,6 +38,12 @@ folderSchema.set('toObject', { virtuals: true });
 
 // Add index for faster queries
 folderSchema.index({ userId: 1, parent_id: 1, deleted: 1 });
+folderSchema.index({ userId: 1, deleted: 1, size: -1 });
+folderSchema.index({ userId: 1, deleted: 1, path: 1 });
+folderSchema.index({ workspaceId: 1, parent_id: 1, deleted: 1 });
+folderSchema.index({ workspaceId: 1, deleted: 1, size: -1 });
+folderSchema.index({ workspaceId: 1, deleted: 1, path: 1 });
+folderSchema.index({ organizationId: 1, workspaceId: 1, deleted: 1 });
 
 // Middleware to check and reset lastAccessed if more than 1 hour old
 folderSchema.pre('save', function(next) {

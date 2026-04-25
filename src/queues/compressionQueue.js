@@ -22,6 +22,38 @@ const compressionQueue = new Queue('compression', redisConfig);
 // Track active jobs and their cancel status
 const activeJobs = new Map();
 
+function normalizeQueueStatus(state) {
+    if (state === 'waiting' || state === 'delayed' || state === 'paused') {
+        return 'queued';
+    }
+
+    if (state === 'active') {
+        return 'running';
+    }
+
+    return state || 'running';
+}
+
+function buildAffectedFiles(job) {
+    const affectedItems = Array.isArray(job.data.affectedItems) ? job.data.affectedItems : [];
+    if (affectedItems.length) {
+        return affectedItems.map(item => ({
+            name: item.name || item.fileName || 'Selected item',
+            fileName: item.fileName || item.name || 'Selected item',
+            size: item.size || null,
+            type: item.type || '',
+            path: item.path || '',
+            status: 'Queued'
+        }));
+    }
+
+    return (job.data.items || []).map(item => ({
+        name: typeof item === 'string' ? item : (item.name || item.id || 'Selected item'),
+        fileName: typeof item === 'string' ? item : (item.name || item.id || 'Selected item'),
+        status: 'Queued'
+    }));
+}
+
 // Handle queue errors
 compressionQueue.on('error', (error) => {
     console.error('Compression Queue Error:', error);
@@ -29,17 +61,7 @@ compressionQueue.on('error', (error) => {
 
 compressionQueue.on('failed', (job, error) => {
     console.error(`Job ${job.id} failed:`, error);
-    try {
-        const io = socket.getIO();
-        io.to(job.data.userId).emit('compressionError', {
-            jobId: job.id,
-            error: error.message
-        });
-    } catch (err) {
-        console.error('Failed to emit compression error:', err);
-    } finally {
-        activeJobs.delete(job.id);
-    }
+    activeJobs.delete(job.id);
 });
 
 compressionQueue.on('completed', (job) => {
@@ -48,7 +70,7 @@ compressionQueue.on('completed', (job) => {
 
 // Process compression jobs
 compressionQueue.process(async (job) => {
-    const { userId, items, folder, zipFileName, parentId, archiveType, compressionLevel, progressId } = job.data;
+    const { userId, items, folder, zipFileName, parentId, archiveType, compressionLevel, progressId, workspaceId } = job.data;
     console.log('Processing compression job:', {
         jobId: job.id,
         progressId,
@@ -100,7 +122,8 @@ compressionQueue.process(async (job) => {
             parentId,
             progressCallback,
             archiveType,
-            compressionLevel
+            compressionLevel,
+            { workspaceId }
         );
 
         // Emit completion event if not cancelled
@@ -163,9 +186,13 @@ compressionQueue.process(async (job) => {
 
 // Function to mark a job as cancelled
 compressionQueue.cancelJob = async (jobId, progressId) => {
+    let job = null;
+
     try {
         // First try to find by Bull's job ID
-        let job = await compressionQueue.getJob(jobId);
+        if (jobId) {
+            job = await compressionQueue.getJob(jobId);
+        }
         
         // If not found and progressId provided, search active jobs
         if (!job && progressId) {
@@ -175,6 +202,12 @@ compressionQueue.cancelJob = async (jobId, progressId) => {
                     break;
                 }
             }
+        }
+
+        // If still not found, search queued jobs by progressId
+        if (!job && progressId) {
+            const queuedJobs = await compressionQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+            job = queuedJobs.find(queuedJob => queuedJob.data.progressId === progressId) || null;
         }
 
         if (!job) {
@@ -227,6 +260,35 @@ compressionQueue.cancelJob = async (jobId, progressId) => {
         }
         return false;
     }
+};
+
+compressionQueue.getActiveJobsForUser = async (userId) => {
+    const normalizedUserId = userId.toString();
+    const jobs = await compressionQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+
+    const matchingJobs = jobs.filter(job =>
+        job && job.data && job.data.userId && job.data.userId.toString() === normalizedUserId
+    );
+
+    return Promise.all(matchingJobs.map(async job => {
+        const state = await job.getState();
+        const progress = await job.progress();
+        const affectedFiles = buildAffectedFiles(job);
+
+        return {
+            jobId: job.id,
+            progressId: job.data.progressId,
+            fileName: job.data.zipFileName || 'Archive',
+            title: `Compressing ${job.data.zipFileName || 'archive'}`,
+            activityType: 'Compression',
+            status: normalizeQueueStatus(state),
+            stage: state,
+            progress: Number(progress) || 0,
+            affectedFiles,
+            affectedFileCount: affectedFiles.length,
+            updatedAt: job.timestamp ? new Date(job.timestamp) : new Date()
+        };
+    }));
 };
 
 module.exports = compressionQueue;

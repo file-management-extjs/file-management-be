@@ -1,10 +1,11 @@
 const cron = require('node-cron');
 const File = require('../models/fileModel');
 const Folder = require('../models/folderModel');
+const { ACCESS_VERIFICATION_WINDOW_MS } = require('../constants/access');
 
 // Function to reset lastAccessed fields older than 30 minutes
 async function resetLastAccessed() {
-    const timeAgo = new Date(Date.now() - 60 * 1000); // 1 minute in milliseconds
+    const timeAgo = new Date(Date.now() - ACCESS_VERIFICATION_WINDOW_MS);
 
     try {
         // Update files - remove expired userAccess entries

@@ -1,5 +1,5 @@
 const VideoService = require('../services/videoService');
-const fs = require('fs');
+const FileService = require('../services/fileService');
 
 exports.streamVideo = async (req, res) => {
     const { fileId } = req.params;
@@ -10,18 +10,18 @@ exports.streamVideo = async (req, res) => {
         return res.status(404).send('Video not found');
     }
 
-    const videoPath = video.path;
-    const videoSize = fs.statSync(videoPath).size;
+    const videoSize = video.size;
     const range = req.headers.range;
 
     if (!range) {
         // Full Content Response
         const headers = {
             'Content-Length': videoSize,
-            'Content-Type': 'video/mp4',
+            'Content-Type': video.mimetype,
         };
         res.writeHead(200, headers);
-        fs.createReadStream(videoPath).pipe(res);
+        const { stream } = await FileService.getFileStream(video.file);
+        stream.pipe(res);
         return;
     }
 
@@ -36,13 +36,13 @@ exports.streamVideo = async (req, res) => {
     }
 
     const chunkSize = end - start + 1;
-    const videoStream = fs.createReadStream(videoPath, { start, end });
+    const { stream: videoStream } = await FileService.getFileStream(video.file, { start, end });
 
     const headers = {
         'Content-Range': `bytes ${start}-${end}/${videoSize}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': chunkSize,
-        'Content-Type': 'video/mp4',
+        'Content-Type': video.mimetype,
     };
 
     res.writeHead(206, headers);  // Status 206: Partial Content
