@@ -32,7 +32,7 @@ function activeDateClause() {
 }
 
 function shareAllowsPermission(share, permission) {
-    if (!share || share.revoked || share.approvalStatus === 'pending' || share.approvalStatus === 'rejected') {
+    if (!share || share.revoked || isApprovalBlockingShare(share)) {
         return false;
     }
 
@@ -111,6 +111,26 @@ function isDownloadLimitReached(entity, policy = null) {
     return maxDownloads !== null && getDownloadCount(entity) >= maxDownloads;
 }
 
+function isExternalShareTarget(share) {
+    const targetType = share && (share.targetType || 'member');
+    return !!share && (share.isExternalTarget === true || targetType === 'external');
+}
+
+function isApprovalBlockingShare(share, policy = null) {
+    if (!isExternalShareTarget(share)) {
+        return false;
+    }
+
+    const approvalStatus = share.approvalStatus || 'not_required';
+    if (approvalStatus === 'pending' || approvalStatus === 'rejected') {
+        return true;
+    }
+
+    return !!policy &&
+        OrganizationPolicyService.normalizeSharingPolicy(policy).requireExternalApproval === true &&
+        approvalStatus !== 'approved';
+}
+
 function canDownloadFromPermissions(permissions) {
     return permissions.includes('manage') || permissions.includes('download') || permissions.includes('edit');
 }
@@ -118,7 +138,7 @@ function canDownloadFromPermissions(permissions) {
 function applyCurrentPolicyToShare(share, policy) {
     const normalizedPolicy = OrganizationPolicyService.normalizeSharingPolicy(policy);
     const targetType = share.targetType || 'member';
-    const external = share.isExternalTarget === true || targetType === 'external';
+    const external = isExternalShareTarget(share);
 
     if (external && normalizedPolicy.externalSharingAllowed === false) {
         return null;
@@ -140,7 +160,7 @@ function applyCurrentPolicyToShare(share, policy) {
         return null;
     }
 
-    if (external && normalizedPolicy.requireExternalApproval && share.approvalStatus !== 'approved') {
+    if (isApprovalBlockingShare(share, normalizedPolicy)) {
         return null;
     }
 
@@ -168,7 +188,7 @@ function addReason(reasons, reason, reasonCounts) {
 function evaluateShareAgainstPolicy(share, policy, reasonCounts = {}) {
     const normalizedPolicy = OrganizationPolicyService.normalizeSharingPolicy(policy);
     const targetType = share.targetType || 'member';
-    const external = share.isExternalTarget === true || targetType === 'external';
+    const external = isExternalShareTarget(share);
     const reasons = [];
 
     if (external && normalizedPolicy.externalSharingAllowed === false) {
@@ -191,7 +211,7 @@ function evaluateShareAgainstPolicy(share, policy, reasonCounts = {}) {
         addReason(reasons, 'external_expiration_required', reasonCounts);
     }
 
-    if (external && normalizedPolicy.requireExternalApproval && share.approvalStatus !== 'approved') {
+    if (isApprovalBlockingShare(share, normalizedPolicy)) {
         addReason(reasons, 'external_approval_required', reasonCounts);
     }
 
@@ -630,7 +650,6 @@ class OrganizationShareService {
 
         return {
             revoked: false,
-            approvalStatus: { $nin: ['pending', 'rejected'] },
             $and: [activeDateClause()],
             $or: [
                 { targetType: { $in: [null, 'member'] }, recipientId: userId.toString() },
@@ -816,7 +835,9 @@ class OrganizationShareService {
             share.expiresAt = this.getExpiryDate(payload);
         }
 
-        if (payload.approvalStatus && ['not_required', 'pending', 'approved', 'rejected'].includes(payload.approvalStatus)) {
+        if (!isExternalShareTarget(share)) {
+            share.approvalStatus = 'not_required';
+        } else if (payload.approvalStatus && ['not_required', 'pending', 'approved', 'rejected'].includes(payload.approvalStatus)) {
             share.approvalStatus = payload.approvalStatus;
         }
 
@@ -1190,6 +1211,9 @@ class OrganizationShareService {
 
     static serializeShare(share, refs = {}) {
         const targetType = share.targetType || 'member';
+        const external = isExternalShareTarget(share);
+        const approvalPending = external && share.approvalStatus === 'pending';
+        const approvalRejected = external && share.approvalStatus === 'rejected';
         let targetLabel = share.targetLabel || '';
         const expired = !!(share.expiresAt && share.expiresAt <= new Date());
         const itemDeleted = refs.item ? refs.item.deleted === true : false;
@@ -1199,8 +1223,10 @@ class OrganizationShareService {
                 ? 'Item deleted'
                 : expired
                 ? 'Expired'
-                : share.approvalStatus === 'pending'
+                : approvalPending
                     ? 'Pending approval'
+                    : approvalRejected
+                    ? 'Rejected'
                     : 'Active';
 
         if (!targetLabel && targetType === 'member' && refs.targetUser) {
@@ -1233,13 +1259,13 @@ class OrganizationShareService {
             itemDeleted,
             permission: share.permission,
             permissions: Array.isArray(share.permissions) && share.permissions.length ? share.permissions : [share.permission || 'view'],
-            approvalStatus: share.approvalStatus || 'not_required',
+            approvalStatus: external ? (share.approvalStatus || 'not_required') : 'not_required',
             shareStatus,
-            isExternalTarget: share.isExternalTarget === true,
-            risky: share.isExternalTarget === true || share.approvalStatus === 'pending',
-            riskReason: share.isExternalTarget === true
+            isExternalTarget: external,
+            risky: external || approvalPending,
+            riskReason: external
                 ? 'External share'
-                : (share.approvalStatus === 'pending' ? 'Waiting for external-share approval' : ''),
+                : '',
             expiresAt: share.expiresAt || null,
             maxDownloads: share.effectiveMaxDownloads !== undefined ? share.effectiveMaxDownloads : (share.maxDownloads || null),
             downloadCount: share.downloadCount || 0,

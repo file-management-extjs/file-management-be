@@ -8,6 +8,58 @@ class SearchService {
         return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
+    static buildLiteralRegex(value) {
+        return new RegExp(this.escapeRegExp(String(value || '').trim()), 'i');
+    }
+
+    static buildOcrTolerantRegex(value) {
+        const text = String(value || '').trim().replace(/\s+/g, ' ');
+        if (text.length < 4 || text.length > 64 || !/[a-z0-9]/i.test(text)) {
+            return null;
+        }
+
+        const substitutions = {
+            a: '[a4]',
+            b: '[b8]',
+            e: '[e3]',
+            g: '[gq9]',
+            i: '[i1l|]',
+            k: '[kzx]',
+            l: '[l1i|]',
+            m: '[mn]',
+            n: '[nmy]',
+            o: '[o0q]',
+            q: '[q0og]',
+            s: '[s5]',
+            t: '[t7]',
+            y: '[yn]',
+            z: '[z2k]',
+            0: '[0oq]',
+            1: '[1il|]',
+            2: '[2z]',
+            3: '[3e]',
+            4: '[4a]',
+            5: '[5s]',
+            7: '[7t]',
+            8: '[8b]',
+            9: '[9gq]'
+        };
+
+        const pattern = text.split(' ')
+            .filter(Boolean)
+            .map(word => Array.from(word).map(char => {
+                if (/\s/.test(char)) {
+                    return '\\s+';
+                }
+
+                const lower = char.toLowerCase();
+                return substitutions[lower] || this.escapeRegExp(char);
+            }).join('\\s*'))
+            .join('\\s+');
+
+        return new RegExp(pattern, 'i');
+    }
+
     static hasValidRecentAccess(item, userId) {
         const userAccess = item.userAccess && item.userAccess.find(
             access => access.userId === userId.toString()
@@ -84,15 +136,31 @@ class SearchService {
         return ancestors;
     }
 
-    static buildContentSearchFilter(searchRegex) {
+    static buildContentSearchFilter(searchRegex, ocrSearchRegex = null) {
+        const contentFilters = [
+            { 'contentIntelligence.searchableText': searchRegex }
+        ];
+
+        if (ocrSearchRegex) {
+            contentFilters.push({ 'contentIntelligence.searchableText': ocrSearchRegex });
+        }
+
+        contentFilters.push(
+            { 'contentIntelligence.tags': searchRegex },
+            { 'contentIntelligence.classification': searchRegex },
+            { 'contentIntelligence.summary': searchRegex }
+        );
+
         return {
             $or: [
                 { name: searchRegex },
                 { path: searchRegex },
-                { 'contentIntelligence.searchableText': searchRegex },
-                { 'contentIntelligence.tags': searchRegex },
-                { 'contentIntelligence.classification': searchRegex },
-                { 'contentIntelligence.summary': searchRegex }
+                {
+                    $and: [
+                        { 'contentIntelligence.status': 'completed' },
+                        { $or: contentFilters }
+                    ]
+                }
             ]
         };
     }
@@ -108,13 +176,14 @@ class SearchService {
         try {
             const workspaceContext = await WorkspaceService.assertWorkspaceAccess(userId, options.workspaceId || null);
             const scopedQuery = this.getScopedQuery(workspaceContext);
-            const searchRegex = new RegExp(this.escapeRegExp(query), 'i');
+            const searchRegex = this.buildLiteralRegex(query);
+            const ocrSearchRegex = this.buildOcrTolerantRegex(query);
             const [files, folders] = await Promise.all([
                 // Search in files
                 File.find({
                     ...scopedQuery,
                     deleted: false,
-                    ...this.buildContentSearchFilter(searchRegex)
+                    ...this.buildContentSearchFilter(searchRegex, ocrSearchRegex)
                 })
                 .select('name path mimetype size createdAt parent_id isPasswordProtected workspaceId workspaceType organizationId createdByUserId userId contentIntelligence.status contentIntelligence.classification contentIntelligence.tags contentIntelligence.textExcerpt')
                 .limit(limit)

@@ -144,6 +144,24 @@ function uniqueStrings(values, max = 20) {
     return result.slice(0, max);
 }
 
+function responseErrorMessage(responseBody) {
+    const text = String(responseBody || '').trim();
+    if (!text) {
+        return 'Empty error response.';
+    }
+
+    try {
+        const parsed = JSON.parse(text);
+        return String(parsed.error || parsed.message || text).trim();
+    } catch (error) {
+        return text;
+    }
+}
+
+function unwrapServiceRequestError(message) {
+    return String(message || '').replace(/^Provider request failed with HTTP \d+:\s*/, '');
+}
+
 function postRequest(urlString, { headers = {}, body = null, timeoutMs = 90000, binary = false } = {}) {
     return new Promise((resolve, reject) => {
         const url = new URL(urlString);
@@ -169,7 +187,7 @@ function postRequest(urlString, { headers = {}, body = null, timeoutMs = 90000, 
             response.on('end', () => {
                 const responseBody = Buffer.concat(chunks).toString('utf8');
                 if (response.statusCode < 200 || response.statusCode >= 300) {
-                    const error = new Error(`Provider request failed with HTTP ${response.statusCode}: ${responseBody.slice(0, 300)}`);
+                    const error = new Error(`Provider request failed with HTTP ${response.statusCode}: ${responseErrorMessage(responseBody).slice(0, 1000)}`);
                     error.statusCode = response.statusCode;
                     reject(error);
                     return;
@@ -661,6 +679,10 @@ class ContentIntelligenceService {
                 provider: analysis.provider || settings.provider.type || 'local',
                 model: analysis.model || settings.provider.model || null,
                 extractionMethod: extraction.method || null,
+                ocrProvider: extraction.ocrProvider || settings.ocr.provider || null,
+                ocrModel: extraction.ocrModel || settings.ocr.model || null,
+                ocrFallbackApplied: extraction.ocrFallbackApplied === true,
+                ocrError: extraction.ocrError || null,
                 ocrApplied: extraction.ocrApplied === true,
                 imageRecognized: analysis.imageRecognized === true,
                 error: null,
@@ -680,12 +702,32 @@ class ContentIntelligenceService {
                 })
             };
         } catch (error) {
+            const provider = settings && settings.provider ? settings.provider : {};
+            const ocr = settings && settings.ocr ? settings.ocr : {};
+            const message = error.message || 'Content intelligence failed.';
             file.contentIntelligence = {
                 ...(file.contentIntelligence || {}),
                 status: 'failed',
                 stage: 'failed',
                 progress: 0,
-                error: error.message || 'Content intelligence failed.',
+                searchableText: '',
+                textExcerpt: '',
+                textLength: 0,
+                language: null,
+                classification: null,
+                tags: [],
+                summary: '',
+                entities: [],
+                provider: provider.type || null,
+                model: provider.model || null,
+                extractionMethod: null,
+                ocrProvider: ocr.provider || null,
+                ocrModel: ocr.model || null,
+                ocrFallbackApplied: false,
+                ocrError: message,
+                ocrApplied: false,
+                imageRecognized: false,
+                error: message,
                 manuallyTriggered: manual === true,
                 lastRunAt: new Date(),
                 completedAt: new Date()
@@ -706,24 +748,34 @@ class ContentIntelligenceService {
         }
 
         const fileBuffer = await fs.readFile(filePath);
-        const raw = await postRequest(`${serviceUrl}/api/content-intelligence/analyze`, {
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                file: {
-                    id: safeId(file._id),
-                    name: file.name,
-                    path: file.path,
-                    mimetype: file.mimetype || mime.getType(file.name || filePath) || 'application/octet-stream',
-                    size: file.size || fileBuffer.length,
-                    base64: fileBuffer.toString('base64')
+        let raw;
+        try {
+            raw = await postRequest(`${serviceUrl}/api/content-intelligence/analyze`, {
+                headers: {
+                    'Content-Type': 'application/json'
                 },
-                capability,
-                settings
-            }),
-            timeoutMs: config.contentIntelligence.requestTimeoutMs
-        });
+                body: JSON.stringify({
+                    file: {
+                        id: safeId(file._id),
+                        name: file.name,
+                        path: file.path,
+                        mimetype: file.mimetype || mime.getType(file.name || filePath) || 'application/octet-stream',
+                        size: file.size || fileBuffer.length,
+                        base64: fileBuffer.toString('base64')
+                    },
+                    capability,
+                    settings
+                }),
+                timeoutMs: config.contentIntelligence.requestTimeoutMs
+            });
+        } catch (error) {
+            if (error.statusCode) {
+                const serviceError = new Error(unwrapServiceRequestError(error.message));
+                serviceError.statusCode = error.statusCode;
+                throw serviceError;
+            }
+            throw error;
+        }
         const parsed = JSON.parse(raw);
 
         if (!parsed.success) {

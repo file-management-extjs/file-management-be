@@ -935,6 +935,10 @@ class FileService {
                 provider: file.contentIntelligence.provider || null,
                 model: file.contentIntelligence.model || null,
                 extractionMethod: file.contentIntelligence.extractionMethod || null,
+                ocrProvider: file.contentIntelligence.ocrProvider || null,
+                ocrModel: file.contentIntelligence.ocrModel || null,
+                ocrFallbackApplied: file.contentIntelligence.ocrFallbackApplied === true,
+                ocrError: file.contentIntelligence.ocrError || null,
                 ocrApplied: file.contentIntelligence.ocrApplied === true,
                 imageRecognized: file.contentIntelligence.imageRecognized === true,
                 error: file.contentIntelligence.error || null,
@@ -1176,16 +1180,10 @@ class FileService {
 
             // Add search filter if provided
             if (search) {
-                const searchRegex = new RegExp(this.escapeRegExp(search), 'i');
+                const searchRegex = SearchService.buildLiteralRegex(search);
+                const ocrSearchRegex = SearchService.buildOcrTolerantRegex(search);
                 foldersQuery.name = searchRegex;
-                filesQuery.$or = [
-                    { name: searchRegex },
-                    { path: searchRegex },
-                    { 'contentIntelligence.searchableText': searchRegex },
-                    { 'contentIntelligence.tags': searchRegex },
-                    { 'contentIntelligence.classification': searchRegex },
-                    { 'contentIntelligence.summary': searchRegex }
-                ];
+                filesQuery.$or = SearchService.buildContentSearchFilter(searchRegex, ocrSearchRegex).$or;
             }
 
             // Stream folders using a Mongoose cursor
