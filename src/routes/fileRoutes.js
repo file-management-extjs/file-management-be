@@ -28,7 +28,10 @@ const {
     searchItems,
     updateFileContent,
     revokeItemShares,
-    getBackgroundActivity
+    getBackgroundActivity,
+    getPrivateVaultStatus,
+    setupPrivateVault,
+    unlockPrivateVault
 } = require('../controllers/fileController');
 const {
     createDirectLink,
@@ -49,6 +52,9 @@ router.get('/summary', getDashboardSummary);
 router.get('/dashboard/summary', getDashboardSummary);
 router.get('/background-activity', getBackgroundActivity);
 router.get('/storage-insights', getStorageInsights);
+router.get('/private-vault/status', getPrivateVaultStatus);
+router.post('/private-vault/setup', setupPrivateVault);
+router.post('/private-vault/unlock', unlockPrivateVault);
 router.post('/scan/:fileId', requestVirusScan);
 router.get('/', getFiles);
 // router.get('/download/:name', downloadFile);

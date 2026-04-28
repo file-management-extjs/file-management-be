@@ -13,6 +13,7 @@ const config = require('../config');
 const OrganizationPolicyService = require('./organizationPolicyService');
 const ActivityEventService = require('./activityEventService');
 const WorkspaceService = require('./workspaceService');
+const FileService = require('./fileService');
 
 class PublicShareError extends Error {
     constructor(message, statusCode = 400, code = 'SHARE_ERROR') {
@@ -92,6 +93,12 @@ class ShareLinkService {
         if (itemType === 'file' && item.scanStatus && item.scanStatus !== 'clean') {
             throw new PublicShareError('This file is not available for sharing until virus scan is clean.', 409, 'ITEM_NOT_READY');
         }
+
+        await FileService.assertNotInsidePrivateVault(
+            item,
+            workspaceContext,
+            'Private Vault items cannot be shared through public links.'
+        );
 
         return { item, itemType, workspaceContext };
     }

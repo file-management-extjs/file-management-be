@@ -104,6 +104,10 @@ class SearchService {
     }
 
     static async isVisibleInSearch(userId, item, workspaceContext) {
+        if (item.isPasswordProtected && !this.hasValidRecentAccess(item, userId)) {
+            return false;
+        }
+
         return !await this.hasLockedProtectedAncestor(userId, item.parent_id, workspaceContext);
     }
 
@@ -185,7 +189,7 @@ class SearchService {
                     deleted: false,
                     ...this.buildContentSearchFilter(searchRegex, ocrSearchRegex)
                 })
-                .select('name path mimetype size createdAt parent_id isPasswordProtected workspaceId workspaceType organizationId createdByUserId userId contentIntelligence.status contentIntelligence.classification contentIntelligence.tags contentIntelligence.textExcerpt')
+                .select('name path mimetype size createdAt parent_id isPasswordProtected userAccess workspaceId workspaceType organizationId createdByUserId userId contentIntelligence.status contentIntelligence.classification contentIntelligence.tags contentIntelligence.textExcerpt')
                 .limit(limit)
                 .lean(),
 
@@ -195,7 +199,7 @@ class SearchService {
                     deleted: false,
                     name: searchRegex
                 })
-                .select('name path size createdAt parent_id isPasswordProtected workspaceId workspaceType organizationId createdByUserId userId')
+                .select('name path size createdAt parent_id isPasswordProtected userAccess isPrivateVaultRoot workspaceId workspaceType organizationId createdByUserId userId')
                 .limit(limit)
                 .lean()
             ]);

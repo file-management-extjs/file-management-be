@@ -28,6 +28,8 @@ class FileService {
     static uploadDirectory = config.storage.localRoot;
     static tempDirectory = config.storage.tempRoot;
     static ongoingCompressions = new Map();
+    static privateVaultFolderName = 'Private Vault';
+    static privateVaultStorageDir = '.private-vault';
 
     static async resolveWorkspaceContext(userId, workspaceId = null, options = {}) {
         return WorkspaceService.assertWorkspaceAccess(userId, workspaceId, options);
@@ -41,6 +43,16 @@ class FileService {
         return this.resolveWorkspaceContext(userId, options.workspaceId || null, options);
     }
 
+    static getWorkspaceContextFromItem(item) {
+        return {
+            workspace: {
+                _id: item.workspaceId || null,
+                type: item.workspaceType || 'personal',
+                organizationId: item.organizationId || null
+            }
+        };
+    }
+
     static getWorkspaceItemPatch(workspaceContext, userId) {
         return WorkspaceService.getWorkspacePatch(workspaceContext.workspace, userId);
     }
@@ -49,8 +61,20 @@ class FileService {
         return WorkspaceService.getItemScopeQuery(workspaceContext.workspace, extra);
     }
 
+    static getAncestorScope(item, workspaceContext = null) {
+        const workspaceId = workspaceContext && workspaceContext.workspace
+            ? workspaceContext.workspace._id
+            : item && item.workspaceId;
+
+        if (workspaceId) {
+            return { workspaceId: workspaceId.toString() };
+        }
+
+        return { userId: item && item.userId ? item.userId.toString() : '' };
+    }
+
     static getStorageInsightKey(workspaceContext, userId) {
-        return workspaceContext && workspaceContext.workspace
+        return workspaceContext && workspaceContext.workspace && workspaceContext.workspace._id
             ? workspaceContext.workspace._id.toString()
             : userId;
     }
@@ -66,7 +90,7 @@ class FileService {
     }
 
     static hasValidRecentAccess(item, userId) {
-        const userAccess = item.userAccess.find(
+        const userAccess = (item.userAccess || []).find(
             access => access.userId === userId.toString()
         );
 
@@ -76,8 +100,246 @@ class FileService {
 
     static assertPasswordAccess(item, userId) {
         if (item.isPasswordProtected && !this.hasValidRecentAccess(item, userId)) {
-            throw new Error('Password verification required');
+            throw this.createServiceError('Password verification required', 401);
         }
+    }
+
+    static grantPasswordAccess(item, userId) {
+        const normalizedUserId = userId.toString();
+        const userAccessIndex = (item.userAccess || []).findIndex(
+            access => access.userId === normalizedUserId
+        );
+
+        if (userAccessIndex >= 0) {
+            item.userAccess[userAccessIndex].lastAccessed = new Date();
+        } else {
+            item.userAccess.push({
+                userId: normalizedUserId,
+                lastAccessed: new Date()
+            });
+        }
+    }
+
+    static assertPersonalWorkspaceContext(workspaceContext) {
+        if (!workspaceContext || !workspaceContext.workspace || workspaceContext.workspace.type !== 'personal') {
+            throw this.createServiceError('Private Vault is available only in personal workspaces.', 403);
+        }
+    }
+
+    static getPrivateVaultFolderPath(workspaceContext) {
+        return path.join(workspaceContext.workspace.rootPath, this.privateVaultStorageDir);
+    }
+
+    static async findPrivateVaultRoot(userId, workspaceContext, options = {}) {
+        const query = {
+            userId: userId.toString(),
+            workspaceId: workspaceContext.workspace._id.toString(),
+            isPrivateVaultRoot: true,
+            deleted: false
+        };
+        const request = Folder.findOne(query);
+
+        return options.includePassword === true ? request.select('+password') : request;
+    }
+
+    static serializePrivateVaultStatus(vaultRoot, userId, workspaceContext) {
+        return {
+            available: true,
+            workspaceId: workspaceContext.workspace._id.toString(),
+            workspaceType: workspaceContext.workspace.type,
+            exists: !!vaultRoot,
+            rootFolderId: vaultRoot ? vaultRoot._id.toString() : null,
+            name: this.privateVaultFolderName,
+            locked: vaultRoot ? !this.hasValidRecentAccess(vaultRoot, userId) : true
+        };
+    }
+
+    static async getPrivateVaultStatus(userId, options = {}) {
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        this.assertPersonalWorkspaceContext(workspaceContext);
+
+        const vaultRoot = await this.findPrivateVaultRoot(userId, workspaceContext);
+        return this.serializePrivateVaultStatus(vaultRoot, userId, workspaceContext);
+    }
+
+    static async setupPrivateVault(userId, password, options = {}) {
+        if (!password || String(password).length < 6) {
+            throw this.createServiceError('Private Vault password must be at least 6 characters long.', 400);
+        }
+
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, {
+            ...options,
+            requireWrite: true
+        });
+        this.assertPersonalWorkspaceContext(workspaceContext);
+
+        const existingVault = await this.findPrivateVaultRoot(userId, workspaceContext);
+        if (existingVault) {
+            return this.serializePrivateVaultStatus(existingVault, userId, workspaceContext);
+        }
+
+        const vaultPath = this.getPrivateVaultFolderPath(workspaceContext);
+        if (!StorageService.isObjectStorage()) {
+            await fs.ensureDir(path.join(this.uploadDirectory, vaultPath));
+        }
+
+        const workspacePatch = this.getWorkspaceItemPatch(workspaceContext, userId);
+        const vaultRoot = new Folder({
+            userId,
+            ...workspacePatch,
+            parent_id: null,
+            name: this.privateVaultFolderName,
+            path: vaultPath,
+            isPrivateVaultRoot: true,
+            isPasswordProtected: true,
+            password: await bcrypt.hash(password, 10),
+            userAccess: [{
+                userId: userId.toString(),
+                lastAccessed: new Date()
+            }],
+            createdAt: new Date()
+        });
+
+        await vaultRoot.save();
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
+
+        return this.serializePrivateVaultStatus(vaultRoot, userId, workspaceContext);
+    }
+
+    static async unlockPrivateVault(userId, password, options = {}) {
+        if (!password) {
+            throw this.createServiceError('Password is required.', 400);
+        }
+
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        this.assertPersonalWorkspaceContext(workspaceContext);
+
+        const vaultRoot = await this.findPrivateVaultRoot(userId, workspaceContext, { includePassword: true });
+        if (!vaultRoot) {
+            throw this.createServiceError('Private Vault has not been created yet.', 404);
+        }
+
+        const isValid = await bcrypt.compare(password, vaultRoot.password || '');
+        if (!isValid) {
+            throw this.createServiceError('Invalid password', 401);
+        }
+
+        this.grantPasswordAccess(vaultRoot, userId);
+        await vaultRoot.save();
+
+        return this.serializePrivateVaultStatus(vaultRoot, userId, workspaceContext);
+    }
+
+    static async assertUnlockedItemAndAncestors(userId, item, workspaceContext, options = {}) {
+        if (!item) {
+            return;
+        }
+
+        if (options.includeItem !== false) {
+            this.assertPasswordAccess(item, userId);
+        }
+
+        const scopedQuery = this.getAncestorScope(item, workspaceContext);
+        let currentFolderId = options.parentId !== undefined ? options.parentId : item.parent_id;
+
+        while (currentFolderId) {
+            const folder = await Folder.findOne({
+                _id: currentFolderId,
+                ...scopedQuery,
+                deleted: false
+            });
+
+            if (!folder) {
+                break;
+            }
+
+            this.assertPasswordAccess(folder, userId);
+            currentFolderId = folder.parent_id;
+        }
+    }
+
+    static async assertUnlockedFolderPath(userId, folderId, workspaceContext) {
+        const normalizedFolderId = this.normalizeFolderId(folderId);
+        if (!normalizedFolderId || normalizedFolderId === 'root') {
+            return null;
+        }
+
+        const folder = await Folder.findOne({
+            _id: normalizedFolderId,
+            ...this.getScopedItemQuery(workspaceContext),
+            deleted: false
+        });
+
+        if (!folder) {
+            throw this.createServiceError('Folder not found or access denied', 404);
+        }
+
+        await this.assertUnlockedItemAndAncestors(userId, folder, workspaceContext);
+        return folder;
+    }
+
+    static async isInsidePrivateVault(item, workspaceContext) {
+        if (!item) {
+            return false;
+        }
+
+        if (item.isPrivateVaultRoot === true) {
+            return true;
+        }
+
+        const scopedQuery = this.getAncestorScope(item, workspaceContext);
+        let currentFolderId = item.parent_id;
+
+        while (currentFolderId) {
+            const folder = await Folder.findOne({
+                _id: currentFolderId,
+                ...scopedQuery,
+                deleted: false
+            }).select('_id parent_id isPrivateVaultRoot').lean();
+
+            if (!folder) {
+                return false;
+            }
+
+            if (folder.isPrivateVaultRoot === true) {
+                return true;
+            }
+
+            currentFolderId = folder.parent_id;
+        }
+
+        return false;
+    }
+
+    static assertNotPrivateVaultRoot(item, action = 'modified') {
+        if (item && item.isPrivateVaultRoot === true) {
+            throw this.createServiceError(`Private Vault root cannot be ${action}.`, 403);
+        }
+    }
+
+    static async assertNotInsidePrivateVault(item, workspaceContext, message = 'Private Vault items cannot be shared.') {
+        if (await this.isInsidePrivateVault(item, workspaceContext)) {
+            throw this.createServiceError(message, 403);
+        }
+    }
+
+    static async assertFilesListAccess(userId, parentId = null, options = {}) {
+        if (options.sharedByMe || !parentId) {
+            return;
+        }
+
+        if (options.shared) {
+            const parentFolder = await this.getAccessibleFolderById(userId, parentId);
+            if (!parentFolder) {
+                throw this.createServiceError('Shared folder not found or access denied', 404);
+            }
+
+            this.assertPasswordAccess(parentFolder, userId);
+            return;
+        }
+
+        const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
+        await this.assertUnlockedFolderPath(userId, parentId, workspaceContext);
     }
 
     static getActiveShareFilter(recipientId, extra = {}) {
@@ -669,10 +931,7 @@ class FileService {
         const workspace = workspaceContext.workspace;
 
         if (parentId) {
-            const parentFolder = await Folder.findById(parentId);
-            if (!parentFolder || parentFolder.workspaceId !== workspace._id.toString()) {
-                throw new Error('Parent folder not found or access denied');
-            }
+            const parentFolder = await this.assertUnlockedFolderPath(userId, parentId, workspaceContext);
 
             return parentFolder.path;
         }
@@ -699,10 +958,7 @@ class FileService {
             };
         }
 
-        const folder = await Folder.findById(normalizedFolderId);
-        if (!folder || folder.workspaceId !== workspace._id.toString()) {
-            throw new Error('Target folder not found or access denied');
-        }
+        const folder = await this.assertUnlockedFolderPath(userId, normalizedFolderId, workspaceContext);
 
         return {
             uploadDir: StorageService.isObjectStorage()
@@ -867,8 +1123,7 @@ class FileService {
                 ...childScope,
                 scanStatus: {$in: [null, 'clean']}
             });
-        const isLocked = folder.isPasswordProtected &&
-            !folder.userAccess.some(access => access.userId === viewerId.toString());
+        const isLocked = folder.isPasswordProtected && !this.hasValidRecentAccess(folder, viewerId);
         const shared = await this.decorateSharedItem(folder, viewerId, 'folder');
         const outgoingShare = await this.decorateOutgoingShareItem(folder, viewerId, 'folder');
         const ancestors = Array.isArray(extra.ancestors)
@@ -889,6 +1144,7 @@ class FileService {
             ancestors,
             isLocked,
             isPasswordProtected: folder.isPasswordProtected,
+            isPrivateVaultRoot: folder.isPrivateVaultRoot === true,
             size: folder.size,
             createdAt: folder.createdAt,
             path: folder.path,
@@ -899,8 +1155,7 @@ class FileService {
     }
 
     static async serializeFile(file, viewerId, extra = {}) {
-        const isLocked = file.isPasswordProtected &&
-            !file.userAccess.some(access => access.userId === viewerId.toString());
+        const isLocked = file.isPasswordProtected && !this.hasValidRecentAccess(file, viewerId);
         const shared = await this.decorateSharedItem(file, viewerId, 'file');
         const outgoingShare = await this.decorateOutgoingShareItem(file, viewerId, 'file');
 
@@ -1161,6 +1416,10 @@ class FileService {
             const workspaceContext = await this.getWorkspaceContextFromOptions(userId, options);
             const workspaceId = workspaceContext.workspace._id.toString();
 
+            if (!search && parentId) {
+                await this.assertUnlockedFolderPath(userId, parentId, workspaceContext);
+            }
+
             let foldersQuery = { 
                 workspaceId,
                 deleted: false
@@ -1176,6 +1435,10 @@ class FileService {
             if (!search && parentId !== undefined) {
                 foldersQuery.parent_id = parentId || null;
                 filesQuery.parent_id = parentId || null;
+
+                if (!parentId) {
+                    foldersQuery.isPrivateVaultRoot = { $ne: true };
+                }
             }
 
             // Add search filter if provided
@@ -1190,7 +1453,10 @@ class FileService {
             const foldersStream = Folder.find(foldersQuery).cursor();
 
             for await (const folder of foldersStream) {
-                if (search && await SearchService.hasLockedProtectedAncestor(userId, folder.parent_id, workspaceContext)) {
+                if (search && (
+                    (folder.isPasswordProtected && !this.hasValidRecentAccess(folder, userId)) ||
+                    await SearchService.hasLockedProtectedAncestor(userId, folder.parent_id, workspaceContext)
+                )) {
                     continue;
                 }
 
@@ -1213,7 +1479,7 @@ class FileService {
             }
         } catch (error) {
             console.error('Error streaming files:', error);
-            throw new Error('Failed to stream files and folders');
+            throw error;
         }
     }
 
@@ -1254,7 +1520,7 @@ class FileService {
             File.countDocuments({ ...filesQuery, isPasswordProtected: true }),
             Folder.countDocuments({ ...foldersQuery, isPasswordProtected: true }),
             File.countDocuments({ ...filesQuery, parent_id: null }),
-            Folder.countDocuments({ ...foldersQuery, parent_id: null }),
+            Folder.countDocuments({ ...foldersQuery, parent_id: null, isPrivateVaultRoot: { $ne: true } }),
             File.aggregate([
                 { $match: filesQuery },
                 {
@@ -1289,38 +1555,52 @@ class FileService {
                 .limit(8)
                 .lean(),
             Folder.find(foldersQuery)
-                .select('_id name path size createdAt parent_id isPasswordProtected')
+                .select('_id name path size createdAt parent_id isPasswordProtected userAccess')
+                .where('isPrivateVaultRoot').ne(true)
                 .sort({ createdAt: -1 })
                 .limit(8)
                 .lean()
         ]);
 
-        const recentFileItems = await Promise.all(recentFiles.map(async (file) => ({
-            id: file._id.toString(),
-            name: file.name,
-            path: file.path,
-            mimetype: file.mimetype,
-            type: file.mimetype,
-            size: file.size || 0,
-            createdAt: file.createdAt,
-            isFolder: false,
-            isPasswordProtected: file.isPasswordProtected,
-            parent_id: file.parent_id,
-            ancestors: await this.buildFolderAncestors(userId, file.parent_id, { workspaceContext })
-        })));
+        const recentFileItems = (await Promise.all(recentFiles.map(async (file) => {
+            if (await SearchService.hasLockedProtectedAncestor(userId, file.parent_id, workspaceContext)) {
+                return null;
+            }
 
-        const recentFolderItems = await Promise.all(recentFolders.map(async (folder) => ({
-            id: folder._id.toString(),
-            name: folder.name,
-            path: folder.path,
-            type: 'Folder',
-            size: folder.size || 0,
-            createdAt: folder.createdAt,
-            isFolder: true,
-            isPasswordProtected: folder.isPasswordProtected,
-            parent_id: folder.parent_id,
-            ancestors: await this.buildFolderAncestors(userId, folder._id, { workspaceContext })
-        })));
+            return {
+                id: file._id.toString(),
+                name: file.name,
+                path: file.path,
+                mimetype: file.mimetype,
+                type: file.mimetype,
+                size: file.size || 0,
+                createdAt: file.createdAt,
+                isFolder: false,
+                isPasswordProtected: file.isPasswordProtected,
+                parent_id: file.parent_id,
+                ancestors: await this.buildFolderAncestors(userId, file.parent_id, { workspaceContext })
+            };
+        }))).filter(Boolean);
+
+        const recentFolderItems = (await Promise.all(recentFolders.map(async (folder) => {
+            if ((folder.isPasswordProtected && !this.hasValidRecentAccess(folder, userId)) ||
+                await SearchService.hasLockedProtectedAncestor(userId, folder.parent_id, workspaceContext)) {
+                return null;
+            }
+
+            return {
+                id: folder._id.toString(),
+                name: folder.name,
+                path: folder.path,
+                type: 'Folder',
+                size: folder.size || 0,
+                createdAt: folder.createdAt,
+                isFolder: true,
+                isPasswordProtected: folder.isPasswordProtected,
+                parent_id: folder.parent_id,
+                ancestors: await this.buildFolderAncestors(userId, folder._id, { workspaceContext })
+            };
+        }))).filter(Boolean);
 
         const recentItems = [...recentFileItems, ...recentFolderItems]
             .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt))
@@ -1471,6 +1751,7 @@ class FileService {
         if (!file) {
             throw new Error('File not found');
         }
+        await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
         await StorageService.deleteFile(file);
         file.deleted = true; // Assuming you have a 'deleted' field
         await file.save();
@@ -1500,6 +1781,8 @@ class FileService {
         // Delete files
         for (const file of files) {
             try {
+                await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
+
                 if (!file.path) {
                     console.warn(`File path is undefined for file ID: ${file._id}`);
                     deletionResults.errors.push(`Invalid path for file: ${file.name}`);
@@ -1521,6 +1804,9 @@ class FileService {
         // Process folders and their contents
         for (const folder of folders) {
             try {
+                this.assertNotPrivateVaultRoot(folder, 'deleted');
+                await this.assertUnlockedItemAndAncestors(userId, folder, workspaceContext);
+
                 if (!folder.path) {
                     console.warn(`Folder path is undefined for folder ID: ${folder._id}`);
                     deletionResults.errors.push(`Invalid path for folder: ${folder.name}`);
@@ -1563,6 +1849,8 @@ class FileService {
             if (!folderToDelete) {
                 throw new Error(`Folder with ID ${folderId} not found.`);
             }
+            this.assertNotPrivateVaultRoot(folderToDelete, 'deleted');
+            await this.assertUnlockedItemAndAncestors(userId, folderToDelete, workspaceContext);
 
             // Find all subfolders and files
             const subFolders = await Folder.find({
@@ -1615,7 +1903,8 @@ class FileService {
         }
 
         await this.assertSharedFileReadyForAccess(file, userId);
-        this.assertPasswordAccess(file, userId);
+        const workspaceContext = this.getWorkspaceContextFromItem(file);
+        await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
 
         const exists = await StorageService.fileExists(file);
 
@@ -1647,7 +1936,8 @@ class FileService {
             throw error;
         }
 
-        this.assertPasswordAccess(file, userId);
+        const workspaceContext = this.getWorkspaceContextFromItem(file);
+        await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
 
         const exists = await StorageService.fileExists(file);
         if (!exists) {
@@ -1677,7 +1967,7 @@ class FileService {
 
         file.size = stats.size;
         await file.save();
-        StorageInsightsService.invalidateUser(userId);
+        StorageInsightsService.invalidateUser(this.getStorageInsightKey(workspaceContext, userId));
 
         if (file.parent_id) {
             await this.recalculateFolderStats(file.parent_id);
@@ -1705,10 +1995,7 @@ class FileService {
         let folderPath = workspace.rootPath; // Start the path with workspace root as the base directory
 
         if (parent_id) {
-            const parentFolder = await Folder.findById(parent_id);
-            if (!parentFolder || parentFolder.workspaceId !== workspace._id.toString()) {
-                throw new Error('Parent folder not found or access denied');
-            }
+            const parentFolder = await this.assertUnlockedFolderPath(userId, parent_id, workspaceContext);
             folderPath = path.join(parentFolder.path, folderName); // Path relative to parent folder
         } else {
             folderPath = path.join(workspace.rootPath, folderName); // Top-level folder under workspace
@@ -1757,6 +2044,7 @@ class FileService {
                 // Try to find the item as a file first
                 const file = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false });
                 if (file) {
+                    await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
                     itemType = 'file';
                     itemPath = StorageService.isObjectStorage()
                         ? await StorageService.materializeFile(file, path.join(compressionTempRoot, 'files', file._id.toString(), file.name))
@@ -1767,6 +2055,8 @@ class FileService {
                     // If not found as file, try as a folder
                     const folder = await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
                     if (folder) {
+                        this.assertNotPrivateVaultRoot(folder, 'compressed');
+                        await this.assertUnlockedItemAndAncestors(userId, folder, workspaceContext);
                         itemType = 'folder';
                         itemPath = StorageService.isObjectStorage()
                             ? await this.materializeFolder(folder, path.join(compressionTempRoot, 'folders', folder._id.toString(), folder.name))
@@ -1916,10 +2206,7 @@ class FileService {
         let parentFolderPath = '';
 
         if (parentId) {
-            const parentFolder = await Folder.findOne({ _id: parentId, ...scopedQuery, deleted: false });
-            if (!parentFolder) {
-                throw new Error('Parent folder not found');
-            }
+            const parentFolder = await this.assertUnlockedFolderPath(userId, parentId, workspaceContext);
             targetDir = StorageService.isObjectStorage()
                 ? path.join(decompressionTempRoot, 'output')
                 : path.join(this.uploadDirectory, parentFolder.path);
@@ -1937,7 +2224,7 @@ class FileService {
                 throw new Error('Archive file not found');
             }
 
-            this.assertPasswordAccess(archiveFile, userId);
+            await this.assertUnlockedItemAndAncestors(userId, archiveFile, workspaceContext);
             zipFilePath = await StorageService.materializeFile(
                 archiveFile,
                 path.join(decompressionTempRoot, 'archive', archiveFile.name)
@@ -1947,7 +2234,7 @@ class FileService {
             if (!archiveFile) {
                 throw new Error('Archive file not found');
             }
-            this.assertPasswordAccess(archiveFile, userId);
+            await this.assertUnlockedItemAndAncestors(userId, archiveFile, workspaceContext);
             zipFilePath = path.join(this.uploadDirectory, zipFilePath);
         }
 
@@ -2311,6 +2598,8 @@ class FileService {
             // Find the folder by ID
             item = await Folder.findOne({ _id: itemId, ...scopedQuery, deleted: false });
             if (!item) throw new Error('Folder not found or access denied');
+            this.assertNotPrivateVaultRoot(item, 'renamed');
+            await this.assertUnlockedItemAndAncestors(userId, item, workspaceContext);
 
             // Set old and new paths for renaming
             oldPath = item.path;
@@ -2365,6 +2654,7 @@ class FileService {
             // Find the file by ID
             item = await File.findOne({ _id: itemId, ...scopedQuery, deleted: false });
             if (!item) throw new Error('File not found or access denied');
+            await this.assertUnlockedItemAndAncestors(userId, item, workspaceContext);
 
             // Set old and new paths for renaming
             oldPath = item.path;
@@ -2402,10 +2692,7 @@ class FileService {
         if (!targetFolderId || targetFolderId === 'root') {
             targetFolder = {path: workspace.rootPath};
         } else {
-            targetFolder = await Folder.findOne({ _id: targetFolderId, ...scopedQuery, deleted: false });
-            if (!targetFolder) {
-                throw new Error('Target folder not found or access denied');
-            }
+            targetFolder = await this.assertUnlockedFolderPath(userId, targetFolderId, workspaceContext);
         }
 
         const totalItems = itemIds.length;
@@ -2419,6 +2706,8 @@ class FileService {
                 console.warn(`Item with ID ${itemId} not found. Skipping.`);
                 continue;
             }
+            this.assertNotPrivateVaultRoot(item, 'moved');
+            await this.assertUnlockedItemAndAncestors(userId, item, workspaceContext);
 
             // Define old and new paths
             const oldPath = item.path;
@@ -2491,6 +2780,7 @@ class FileService {
             if (!zipFile || zipFile.mimetype !== 'application/zip') {
                 throw new Error('Target file is not a valid ZIP file.');
             }
+            await this.assertUnlockedItemAndAncestors(userId, zipFile, workspaceContext);
 
             const zipFilePath = StorageService.isObjectStorage()
                 ? await StorageService.materializeFile(zipFile, path.join(zipTempRoot, 'archive', zipFile.name))
@@ -2521,6 +2811,8 @@ class FileService {
                     console.warn(`Item with ID ${itemId} not found. Skipping.`);
                     continue;
                 }
+                this.assertNotPrivateVaultRoot(item, 'moved');
+                await this.assertUnlockedItemAndAncestors(userId, item, workspaceContext);
 
                 const itemPath = StorageService.isObjectStorage()
                     ? item instanceof Folder
@@ -2708,7 +3000,8 @@ class FileService {
         }
 
         await this.assertSharedFileReadyForAccess(file, userId);
-        this.assertPasswordAccess(file, userId);
+        const workspaceContext = this.getWorkspaceContextFromItem(file);
+        await this.assertUnlockedItemAndAncestors(userId, file, workspaceContext);
 
         return file;
     }
@@ -2916,11 +3209,16 @@ class FileService {
                 isRoot = true;
             }
 
+            if (parentId) {
+                await this.assertUnlockedFolderPath(userId, parentId, workspaceContext);
+            }
+
             // Fetch folders for the current parent
             const folders = await Folder.find({ ...scopedQuery, parent_id: parentId, deleted: false }).lean();
 
             // Construct the tree for each folder
             const tree = await Promise.all(folders.map(async (folder) => {
+                const isLocked = folder.isPasswordProtected && !this.hasValidRecentAccess(folder, userId);
                 // Only check for subfolders in tree mode
                 const subfolderCount = await Folder.countDocuments({ 
                     ...scopedQuery,
@@ -2928,14 +3226,19 @@ class FileService {
                     deleted: false 
                 });
 
-                const children = await this.getFolderTree(userId, folder._id, false, { workspaceContext }); // Recursive call to get child folders
+                const children = isLocked
+                    ? []
+                    : await this.getFolderTree(userId, folder._id, false, { workspaceContext }); // Recursive call to get child folders
                 return {
                     id: folder._id,
                     text: folder.name,
+                    iconCls: folder.isPrivateVaultRoot === true ? 'fa fa-user-lock' : 'fa fa-solid fa-folder',
                     expanded: false,
                     children: children.length > 0 ? children : [],
                     parentId: folder.parent_id,
-                    leaf: subfolderCount === 0 // Leaf if no subfolders
+                    isLocked,
+                    isPrivateVaultRoot: folder.isPrivateVaultRoot === true,
+                    leaf: isLocked || subfolderCount === 0 // Leaf if no subfolders, or locked
                 };
             }));
 
@@ -2966,6 +3269,7 @@ class FileService {
         if (!item) {
             throw new Error('Item not found or access denied');
         }
+        await this.assertNotInsidePrivateVault(item, workspaceContext);
 
         const governedShare = workspaceContext.workspace.type === 'organization'
             ? await OrganizationShareService.createShare(userId, workspaceContext.workspace.organizationId, {
@@ -3164,6 +3468,7 @@ class FileService {
             if (!item) {
                 throw new Error('Item not found');
             }
+            this.assertNotPrivateVaultRoot(item, 'changed through item password actions');
 
             // Hash the password before storing
             const hashedPassword = await bcrypt.hash(password, 10);
@@ -3187,6 +3492,7 @@ class FileService {
             if (!item) {
                 throw new Error('Item not found');
             }
+            this.assertNotPrivateVaultRoot(item, 'unlocked permanently');
 
             const isMatch = await bcrypt.compare(currentPassword, item.password);
             if (!isMatch) {
@@ -3222,20 +3528,7 @@ class FileService {
                     return false;
                 }
                 
-                // Update or add user access record for folder
-                const userAccessIndex = folder.userAccess.findIndex(
-                    access => access.userId === userId.toString()
-                );
-                
-                if (userAccessIndex >= 0) {
-                    folder.userAccess[userAccessIndex].lastAccessed = new Date();
-                } else {
-                    folder.userAccess.push({
-                        userId,
-                        lastAccessed: new Date()
-                    });
-                }
-                
+                this.grantPasswordAccess(folder, userId);
                 await folder.save();
             } else {
                 const file = await File.findOne({ _id: itemId, deleted: false }).select('+password');
@@ -3248,20 +3541,7 @@ class FileService {
                     return false;
                 }
                 
-                // Update or add user access record for file
-                const userAccessIndex = file.userAccess.findIndex(
-                    access => access.userId === userId.toString()
-                );
-                
-                if (userAccessIndex >= 0) {
-                    file.userAccess[userAccessIndex].lastAccessed = new Date();
-                } else {
-                    file.userAccess.push({
-                        userId,
-                        lastAccessed: new Date()
-                    });
-                }
-                
+                this.grantPasswordAccess(file, userId);
                 await file.save();
             }
             

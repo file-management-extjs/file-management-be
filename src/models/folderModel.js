@@ -15,6 +15,7 @@ const folderSchema = new mongoose.Schema({
     createdByUserId: { type: String, default: null, index: true },
     parent_id: { type: String, default: null },
     deleted: { type: Boolean, default: false },
+    isPrivateVaultRoot: { type: Boolean, default: false, index: true },
     isPasswordProtected: { type: Boolean, default: false },
     password: { type: String, select: false }, // Will not be included in queries by default
     lastAccessed: { type: Date },
@@ -44,6 +45,13 @@ folderSchema.index({ workspaceId: 1, parent_id: 1, deleted: 1 });
 folderSchema.index({ workspaceId: 1, deleted: 1, size: -1 });
 folderSchema.index({ workspaceId: 1, deleted: 1, path: 1 });
 folderSchema.index({ organizationId: 1, workspaceId: 1, deleted: 1 });
+folderSchema.index(
+    { workspaceId: 1, userId: 1, isPrivateVaultRoot: 1 },
+    {
+        unique: true,
+        partialFilterExpression: { isPrivateVaultRoot: true, deleted: false }
+    }
+);
 
 // Middleware to check and reset lastAccessed if more than 1 hour old
 folderSchema.pre('save', function(next) {

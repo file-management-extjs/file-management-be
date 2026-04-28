@@ -42,7 +42,7 @@ exports.uploadFiles = async (req, res) => {
         return res.status(200).json({ message: 'Chunk uploaded successfully', currentChunk });
     } catch (error) {
         console.error('Error uploading chunk:', error);
-        return res.status(500).json({ error: 'Failed to upload chunk' });
+        return res.status(error.statusCode || 500).json({ error: error.message || 'Failed to upload chunk' });
     }
 };
 
@@ -56,6 +56,8 @@ exports.getFiles = async (req, res) => {
     const workspaceId = req.query.workspaceId || null;
 
     try {
+        await FileService.assertFilesListAccess(userId, parentId, { shared, sharedByMe, workspaceId });
+
         res.setHeader('Content-Type', 'application/json');
         res.write('['); // Start JSON array
         let isFirst = true;
@@ -70,7 +72,61 @@ exports.getFiles = async (req, res) => {
         res.end();
     } catch (error) {
         console.error('Error in getFiles controller:', error);
-        res.status(500).json({ error: 'Failed to fetch files and folders' });
+        const status = error.message === 'Password verification required'
+            ? 401
+            : (error.statusCode || 500);
+
+        if (res.headersSent) {
+            res.end();
+            return;
+        }
+
+        res.status(status).json({ error: error.message || 'Failed to fetch files and folders' });
+    }
+};
+
+exports.getPrivateVaultStatus = async (req, res) => {
+    try {
+        const vault = await FileService.getPrivateVaultStatus(req.userId, {
+            workspaceId: req.query.workspaceId || null
+        });
+
+        res.status(200).json({ success: true, vault });
+    } catch (error) {
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.message || 'Failed to load Private Vault status.'
+        });
+    }
+};
+
+exports.setupPrivateVault = async (req, res) => {
+    try {
+        const vault = await FileService.setupPrivateVault(req.userId, req.body.password, {
+            workspaceId: req.body.workspaceId || null
+        });
+
+        res.status(201).json({ success: true, vault });
+    } catch (error) {
+        res.status(error.statusCode || 400).json({
+            success: false,
+            message: error.message || 'Failed to set up Private Vault.'
+        });
+    }
+};
+
+exports.unlockPrivateVault = async (req, res) => {
+    try {
+        const vault = await FileService.unlockPrivateVault(req.userId, req.body.password, {
+            workspaceId: req.body.workspaceId || null
+        });
+
+        res.status(200).json({ success: true, vault });
+    } catch (error) {
+        res.status(error.statusCode || 400).json({
+            success: false,
+            message: error.message || 'Failed to unlock Private Vault.'
+        });
     }
 };
 
@@ -160,7 +216,7 @@ exports.deleteFile = async (req, res) => {
         await FileService.deleteFile(req.userId, req.params.id, { workspaceId: req.query.workspaceId || req.body.workspaceId || null });
         res.json({ success: true, message: 'File deleted successfully.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Failed to delete file.' });
+        res.status(err.statusCode || 500).json({ success: false, message: err.message || 'Failed to delete file.' });
     }
 };
 
@@ -183,7 +239,7 @@ exports.deleteMultipleFiles = async (req, res) => {
         // }
     } catch (error) {
         console.log(error);
-        res.status(500).json({ success: false, message: 'An error occurred while deleting files.' });
+        res.status(error.statusCode || 500).json({ success: false, message: error.message || 'An error occurred while deleting files.' });
     }
 };
 
@@ -199,7 +255,7 @@ exports.createFolder = async (req, res) => {
         res.status(201).json({ message: 'Folder created successfully' });
     } catch (error) {
         console.error('Error creating folder:', error);
-        res.status(500).json({ error: `Failed to create folder: ${error.message}` });
+        res.status(error.statusCode || 500).json({ error: `Failed to create folder: ${error.message}` });
     }
 };
 
@@ -249,7 +305,7 @@ exports.compressFiles = async (req, res) => {
         });
     } catch (error) {
         console.error('Error in compression:', error);
-        res.status(500).json({ error: error.message });
+        res.status(error.statusCode || 500).json({ error: error.message });
     }
 };
 
@@ -304,7 +360,7 @@ exports.decompressFile = async (req, res) => {
                 detail: error.message
             });
         }
-        res.status(500).json({ error: error.message });
+        res.status(error.statusCode || 500).json({ error: error.message });
     }
 };
 
@@ -349,7 +405,7 @@ exports.renameItem = async (req, res) => {
         });
         res.json({ success: true, message: 'File/Folder renamed successfully.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: `Failed to rename file/folder: ${err.message}` });
+        res.status(err.statusCode || 500).json({ success: false, message: `Failed to rename file/folder: ${err.message}` });
     }
 };
 
@@ -424,7 +480,7 @@ exports.moveItem = async (req, res) => {
             statusText: 'Failed',
             detail: error.message
         });
-        res.status(500).json({ success: false, message: error.message });
+        res.status(error.statusCode || 500).json({ success: false, message: error.message });
     }
 };
 
@@ -572,7 +628,7 @@ exports.getFolderTree = async (req, res) => {
         res.status(200).json({ success: true, folders: tree });
     } catch (error) {
         console.error('Error fetching folder tree:', error);
-        res.status(500).json({ success: false, message: 'Failed to fetch folder tree' });
+        res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to fetch folder tree' });
     }
 };
 
