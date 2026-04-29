@@ -36,7 +36,9 @@ exports.execute = async (req, res) => {
         console.error('Media Conversion Hub error:', error);
         res.status(error.statusCode || 500).json({
             success: false,
-            error: error.message || 'Media conversion failed.'
+            error: error.message || 'Media conversion failed.',
+            message: error.message || 'Media conversion failed.',
+            code: error.code
         });
     }
 };

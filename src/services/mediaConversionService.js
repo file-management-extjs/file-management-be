@@ -21,9 +21,12 @@ class MediaConversionService {
         'thumbnail'
     ];
 
-    static createError(message, statusCode = 400) {
+    static createError(message, statusCode = 400, code = null) {
         const error = new Error(message);
         error.statusCode = statusCode;
+        if (code) {
+            error.code = code;
+        }
         return error;
     }
 
@@ -102,7 +105,11 @@ class MediaConversionService {
         try {
             FileService.assertPasswordAccess(file, userId);
         } catch (error) {
-            throw this.createError(error.message || 'Password verification required.', 403);
+            throw this.createError(
+                error.message || 'Password verification required.',
+                error.statusCode || 403,
+                error.code
+            );
         }
 
         return file;

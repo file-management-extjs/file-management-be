@@ -42,7 +42,11 @@ exports.uploadFiles = async (req, res) => {
         return res.status(200).json({ message: 'Chunk uploaded successfully', currentChunk });
     } catch (error) {
         console.error('Error uploading chunk:', error);
-        return res.status(error.statusCode || 500).json({ error: error.message || 'Failed to upload chunk' });
+        return res.status(error.statusCode || 500).json({
+            error: error.message || 'Failed to upload chunk',
+            message: error.message || 'Failed to upload chunk',
+            code: error.code
+        });
     }
 };
 
@@ -81,7 +85,11 @@ exports.getFiles = async (req, res) => {
             return;
         }
 
-        res.status(status).json({ error: error.message || 'Failed to fetch files and folders' });
+        res.status(status).json({
+            error: error.message || 'Failed to fetch files and folders',
+            message: error.message || 'Failed to fetch files and folders',
+            code: error.code
+        });
     }
 };
 
@@ -570,8 +578,13 @@ exports.getFileSize = async (req, res) => {
         console.error('Error fetching file size:', error.message);
         const status = error.message === 'Password verification required'
             ? 401
-            : error.message === 'Download access denied' ? 403 : 500;
-        res.status(status).json({success: false, message: 'Failed to retrieve file size.'});
+            : error.message === 'Download access denied' ? 403 : (error.statusCode || 500);
+        res.status(status).json({
+            success: false,
+            message: error.message || 'Failed to retrieve file size.',
+            error: error.message || 'Failed to retrieve file size.',
+            code: error.code
+        });
     }
 };
 
@@ -600,7 +613,12 @@ exports.getUploadStatus = async (req, res) => {
         res.status(200).json(uploadStatus); // Return the list of uploaded chunks
     } catch (error) {
         console.error('Error fetching upload status:', error.message);
-        res.status(500).json({ success: false, message: 'Failed to fetch upload status.' });
+        res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.message || 'Failed to fetch upload status.',
+            error: error.message || 'Failed to fetch upload status.',
+            code: error.code
+        });
     }
 };
 
@@ -616,7 +634,12 @@ exports.resetUpload = async (req, res) => {
         return res.status(200).json({ success: true, message: 'Upload session reset successfully.' });
     } catch (error) {
         console.error('Error resetting upload session:', error.message);
-        return res.status(500).json({ success: false, message: 'Failed to reset upload session.' });
+        return res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.message || 'Failed to reset upload session.',
+            error: error.message || 'Failed to reset upload session.',
+            code: error.code
+        });
     }
 };
 

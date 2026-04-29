@@ -79,9 +79,12 @@ class FileService {
             : userId;
     }
 
-    static createServiceError(message, statusCode = 400) {
+    static createServiceError(message, statusCode = 400, code = null) {
         const error = new Error(message);
         error.statusCode = statusCode;
+        if (code) {
+            error.code = code;
+        }
         return error;
     }
 
@@ -100,7 +103,7 @@ class FileService {
 
     static assertPasswordAccess(item, userId) {
         if (item.isPasswordProtected && !this.hasValidRecentAccess(item, userId)) {
-            throw this.createServiceError('Password verification required', 401);
+            throw this.createServiceError('Password verification required', 401, 'PASSWORD_ACCESS_REQUIRED');
         }
     }
 

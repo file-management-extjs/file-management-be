@@ -41,7 +41,9 @@ exports.execute = async (req, res) => {
         console.error('Document Conversion Suite error:', error);
         res.status(error.statusCode || 500).json({
             success: false,
-            error: error.message || 'Document conversion failed.'
+            error: error.message || 'Document conversion failed.',
+            message: error.message || 'Document conversion failed.',
+            code: error.code
         });
     }
 };

@@ -22,7 +22,9 @@ exports.execute = async (req, res) => {
         console.error('PDF Studio error:', error);
         res.status(error.statusCode || 500).json({
             success: false,
-            error: error.message || 'PDF Studio operation failed.'
+            error: error.message || 'PDF Studio operation failed.',
+            message: error.message || 'PDF Studio operation failed.',
+            code: error.code
         });
     }
 };
